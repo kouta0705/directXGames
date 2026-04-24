@@ -1,4 +1,4 @@
-[*.{cpp.h}]
+[*.{cpp,h}]
 charset=utf-8
 
 spelling_error_severity = error
