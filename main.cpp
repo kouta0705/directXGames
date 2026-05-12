@@ -1,6 +1,13 @@
+#include <d3d12.h>
 #include<Windows.h>
 #include<cstdint>
+#include<dxgi1_6.h>
+#include <cassert>
 #include <string>
+
+
+#pragma comment(lib,"d3d12.lib")
+#pragma comment(lib,"dxgi.lib")
 
 
 std::wstring ConvertString(const std::string& str) {
@@ -40,7 +47,7 @@ LRESULT CALLBACK WndowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	//windowsアプリでのエントリーポイント(main関数)
 
-
+	
 
 	switch (msg)
 	{
@@ -90,6 +97,29 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 	ShowWindow(hwnd, SW_SHOW);
 
 	MSG msg{};
+
+	IDXGIFactory7* dxgiFactory = nullptr;
+
+	HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
+
+	assert(SUCCEEDED(hr));
+
+	IDXGIAdapter4* useAdapter = nullptr;
+
+	for (UINT i = 0;dxgiFactory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&useAdapter)) != DXGI_ERROR_NOT_FOUND; ++i)
+	{
+		DXGI_ADAPTER_DESC3 adapterDesc{};
+
+		hr = useAdapter->GetDesc3(&adapterDesc);
+		assert(SUCCEEDED(hr));
+
+		//if (!(adapterDesc.Flags&DXGI_ADAPTER_FLAG3_SOFTWARE))
+		//{
+		//Log(std::)
+		//}
+
+		//p5
+	}
 
 	while (msg.message != WM_QUIT)
 	{
