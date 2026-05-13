@@ -4,6 +4,7 @@
 #include<dxgi1_6.h>
 #include <cassert>
 #include <string>
+#include <format>
 
 
 #pragma comment(lib,"d3d12.lib")
@@ -113,13 +114,36 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 		hr = useAdapter->GetDesc3(&adapterDesc);
 		assert(SUCCEEDED(hr));
 
-		//if (!(adapterDesc.Flags&DXGI_ADAPTER_FLAG3_SOFTWARE))
-		//{
-		//Log(std::)
-		//}
+		if (!(adapterDesc.Flags&DXGI_ADAPTER_FLAG3_SOFTWARE))
+		{
+			Log(ConvertString(std::format(L"Use Adapter: {}\n", adapterDesc.Description)));
+			break;
+		}
 
-		//p5
+		useAdapter = nullptr;
+		
 	}
+	
+	assert(useAdapter != nullptr);
+
+	ID3D12Device* device = nullptr;
+	D3D_FEATURE_LEVEL featureLevels[] =
+	{ D3D_FEATURE_LEVEL_12_2,D3D_FEATURE_LEVEL_12_1,D3D_FEATURE_LEVEL_12_0 };
+
+	const char* fetureLevelString[] = { "12.2","12.1","12.0" };
+
+	for (size_t i = 0;i < std::size(featureLevels);++i)
+	{
+		hr = D3D12CreateDevice(useAdapter, featureLevels[i], IID_PPV_ARGS(&device));
+		if (SUCCEEDED(hr))
+		{
+			Log(std::format("Feature Level: {}\n", fetureLevelString[i]));
+			break;
+		}
+	}
+
+	assert(device != nullptr);
+	Log("conmplete Create D3D12Dvice\n");
 
 	while (msg.message != WM_QUIT)
 	{
