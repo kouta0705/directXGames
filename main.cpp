@@ -51,7 +51,7 @@ void Log(const std::wstring& message)
 	OutputDebugStringA(ConvertString(message).c_str());
 }
 
-LRESULT CALLBACK WndowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	switch (msg)
 	{
@@ -61,13 +61,6 @@ LRESULT CALLBACK WndowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	}
 	return DefWindowProc(hwnd, msg, wParam, lParam);
 }
-
-
-void Log(const std::string& Message)
-{
-	OutputDebugStringA(Message.c_str());
-}
-
 
 int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nCmdShow) {
 
