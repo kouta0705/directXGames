@@ -79,7 +79,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 	Log(ConvertString(std::format(L"wstringValue: {}\n", wstringValue)));
 
 	WNDCLASSW wc{};            // ← WNDCLASSW に変更
-	wc.lpfnWndProc = WndowProc;
+	wc.lpfnWndProc = WindowProc;
 	wc.lpszClassName = L"CG2WindowClass";
 	wc.hInstance = GetModuleHandle(nullptr);
 	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
