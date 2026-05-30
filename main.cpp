@@ -6,6 +6,8 @@
 #include <dxgi1_6.h>
 #include <cassert>
 
+#include <d3dcompiler.h>
+#pragma comment(lib, "d3dcompiler.lib")
 //リークチェック用のヘッダーとライブラリ
 #include <dxgidebug.h>
 #pragma comment(lib, "dxguid.lib")
@@ -179,6 +181,170 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     assert(fenceEvent != nullptr);
 
+    // 頂点シェーダー
+    const char* vsCode = R"(
+struct VSInput {
+    float4 pos : POSITION;
+    float4 color : COLOR;
+};
+struct VSOutput {
+    float4 pos : SV_POSITION;
+    float4 color : COLOR;
+};
+VSOutput main(VSInput input) {
+    VSOutput output;
+    output.pos = input.pos;
+    output.color = input.color;
+    return output;
+}
+)";
+
+    // ピクセルシェーダー
+    const char* psCode = R"(
+struct PSInput {
+    float4 pos : SV_POSITION;
+    float4 color : COLOR;
+};
+float4 main(PSInput input) : SV_TARGET {
+    return input.color;
+}
+)";
+
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    ID3DBlob* errorBlob = nullptr;
+
+    hr = D3DCompile(vsCode, strlen(vsCode), nullptr, nullptr, nullptr,
+        "main", "vs_5_0", D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, 0, &vsBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) { OutputDebugStringA((char*)errorBlob->GetBufferPointer()); errorBlob->Release(); }
+        assert(false);
+    }
+
+    hr = D3DCompile(psCode, strlen(psCode), nullptr, nullptr, nullptr,
+        "main", "ps_5_0", D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, 0, &psBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) { OutputDebugStringA((char*)errorBlob->GetBufferPointer()); errorBlob->Release(); }
+        assert(false);
+    }
+
+    // ============================================================
+    // ルートシグネチャ
+    // ============================================================
+    ID3D12RootSignature* rootSignature = nullptr;
+    D3D12_ROOT_SIGNATURE_DESC rootSigDesc{};
+    rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ID3DBlob* sigBlob = nullptr;
+    hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errorBlob);
+    assert(SUCCEEDED(hr));
+    hr = device->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
+    assert(SUCCEEDED(hr));
+    sigBlob->Release();
+
+    // ============================================================
+    // インプットレイアウト
+    // ============================================================
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    // ============================================================
+    // グラフィックスパイプラインステート
+    // ============================================================
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = rootSignature;
+    psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+    psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+
+    // ブレンドステート（デフォルト）
+    psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    // ラスタライザーステート
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+
+    // インプットレイアウト
+    psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    psoDesc.SampleDesc.Count = 1;
+    psoDesc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
+
+    // デプスステンシル（使わないが設定必要）
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+
+    ID3D12PipelineState* pipelineState = nullptr;
+    hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
+    assert(SUCCEEDED(hr));
+
+    // ============================================================
+    // 頂点バッファ（三角形 3頂点）
+    // スクリーン中央に大きめの白い三角形
+    // NDC座標系: X[-1,1], Y[-1,1]
+    // ============================================================
+    struct Vertex {
+        float pos[4];   // XYZW
+        float color[4]; // RGBA
+    };
+
+    Vertex vertices[] = {
+        // 頂点（上）
+        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
+        // 右下
+        { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
+        // 左下
+        { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
+    };
+
+    UINT vertexBufferSize = sizeof(vertices);
+
+    D3D12_HEAP_PROPERTIES heapProps{};
+    heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC resDesc{};
+    resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resDesc.Width = vertexBufferSize;
+    resDesc.Height = 1;
+    resDesc.DepthOrArraySize = 1;
+    resDesc.MipLevels = 1;
+    resDesc.SampleDesc.Count = 1;
+    resDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* vertexBuffer = nullptr;
+    hr = device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vertexBuffer));
+    assert(SUCCEEDED(hr));
+
+    // 頂点データをバッファにコピー
+    void* mappedData = nullptr;
+    vertexBuffer->Map(0, nullptr, &mappedData);
+    memcpy(mappedData, vertices, vertexBufferSize);
+    vertexBuffer->Unmap(0, nullptr);
+
+    D3D12_VERTEX_BUFFER_VIEW vbView{};
+    vbView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
+    vbView.SizeInBytes = vertexBufferSize;
+    vbView.StrideInBytes = sizeof(Vertex);
+
+    // ============================================================
+    // ビューポートとシザー矩形
+    // ============================================================
+    D3D12_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(kClientWidth);
+    viewport.Height = static_cast<float>(kClientHeight);
+    viewport.MaxDepth = 1.0f;
+
+    D3D12_RECT scissorRect{};
+    scissorRect.right = kClientWidth;
+    scissorRect.bottom = kClientHeight;
+
+
+
+
     //メインループ
     MSG msg{};
     while (msg.message != WM_QUIT) {
@@ -201,6 +367,14 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->OMSetRenderTargets(1, &rtvHandles[backBufferIndex], false, nullptr);
             float clearColor[] = { 0.1f, 0.25f, 0.5f, 1.0f };
             commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
+
+            commandList->SetGraphicsRootSignature(rootSignature);
+            commandList->SetPipelineState(pipelineState);
+            commandList->RSSetViewports(1, &viewport);
+            commandList->RSSetScissorRects(1, &scissorRect);
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            commandList->IASetVertexBuffers(0, 1, &vbView);
+            commandList->DrawInstanced(3, 1, 0, 0);
 
             // TransitionBarrier（RenderTarget -> Present）
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -226,6 +400,12 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->Reset(commandAllocator, nullptr);
         }
     }
+
+    if (vertexBuffer) vertexBuffer->Release();
+    if (pipelineState) pipelineState->Release();
+    if (rootSignature) rootSignature->Release();
+    if (vsBlob) vsBlob->Release();
+    if (psBlob) psBlob->Release();
 
     // 解放処理
     CloseHandle(fenceEvent);
