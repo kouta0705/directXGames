@@ -205,6 +205,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 	hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, nullptr, IID_PPV_ARGS(&commandList));
 	assert(SUCCEEDED(hr));
 
+	commandList->Close();
+
 	IDXGISwapChain4* swapChain = nullptr;
 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
 	swapChainDesc.Width = KClientWidth;
@@ -240,6 +242,12 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 	rtvHandles[1].ptr = rtvHandles[0].ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	device->CreateRenderTargetView(swapChainResources[1], &rtvDesc, rtvHandles[1]);
 
+	ID3D12Fence* fence = nullptr;
+	UINT64 fenceValue = 0;
+	hr = device->CreateFence(fenceValue, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+	assert(SUCCEEDED(hr));
+
+
 
 	while (msg.message != WM_QUIT)
 	{
@@ -252,47 +260,74 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 		{
 			UINT backBufferIndex = swapChain->GetCurrentBackBufferIndex();
 
-			// ← ResourceBarrier を削除（新コードにないため）
-
-			commandList->OMSetRenderTargets(1, &rtvHandles[backBufferIndex], false, nullptr);
-			float clearColor[] = { 0.1f, 0.25f, 0.5f, 1.0f };
-			commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
-			hr = commandList->Close();
-			assert(SUCCEEDED(hr));
-
-			ID3D12CommandList* commandLists[] = { commandList };
-			commandQueue->ExecuteCommandLists(1, commandLists);
-			swapChain->Present(1, 0);
-
-
-
+			// コマンドアロケータとコマンドリストをリセット
 			hr = commandAllocator->Reset();
 			assert(SUCCEEDED(hr));
+
 			hr = commandList->Reset(commandAllocator, nullptr);
 			assert(SUCCEEDED(hr));
 
+			// PRESENT → RENDER_TARGET
 			D3D12_RESOURCE_BARRIER barrier{};
 			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
 			barrier.Transition.pResource = swapChainResources[backBufferIndex];
 			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
 			commandList->ResourceBarrier(1, &barrier);
-			ID3D12Fence* fence = nullptr;
-			UINT64 fenceValue = 0;
-			hr = device->CreateFence(fenceValue, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+
+			// 描画先設定
+			commandList->OMSetRenderTargets(
+				1,
+				&rtvHandles[backBufferIndex],
+				false,
+				nullptr
+			);
+
+			// 画面クリア
+			float clearColor[] = { 0.1f, 0.25f, 0.5f, 1.0f };
+			commandList->ClearRenderTargetView(
+				rtvHandles[backBufferIndex],
+				clearColor,
+				0,
+				nullptr
+			);
+
+			// RENDER_TARGET → PRESENT
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+
+			commandList->ResourceBarrier(1, &barrier);
+
+			// コマンドリスト終了
+			hr = commandList->Close();
 			assert(SUCCEEDED(hr));
-			HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-			assert(fenceEvent != nullptr);
+
+			// GPUへ送信
+			ID3D12CommandList* commandLists[] = { commandList };
+			commandQueue->ExecuteCommandLists(1, commandLists);
+
+			// 表示
+			hr = swapChain->Present(1, 0);
+			assert(SUCCEEDED(hr));
+
+			// GPU待機
 			fenceValue++;
-			commandQueue->Signal(fence, fenceValue);
+			hr = commandQueue->Signal(fence, fenceValue);
+			assert(SUCCEEDED(hr));
 
 			if (fence->GetCompletedValue() < fenceValue)
 			{
-				fence->SetEventOnCompletion(fenceValue, fenceEvent);
+				HANDLE fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+				assert(fenceEvent != nullptr);
+
+				hr = fence->SetEventOnCompletion(fenceValue, fenceEvent);
+				assert(SUCCEEDED(hr));
+
 				WaitForSingleObject(fenceEvent, INFINITE);
-
-
+				CloseHandle(fenceEvent);
 			}
 		}
 	}
