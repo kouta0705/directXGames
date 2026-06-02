@@ -134,6 +134,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     ID3D12GraphicsCommandList* commandList = nullptr;
     hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, nullptr, IID_PPV_ARGS(&commandList));
     assert(SUCCEEDED(hr));
+    commandList->Close();
 
     //スワップチェーン生成
     IDXGISwapChain4* swapChain = nullptr;
@@ -362,6 +363,7 @@ float4 main(PSInput input) : SV_TARGET {
             barrier.Transition.pResource = swapChainResources[backBufferIndex];
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             commandList->ResourceBarrier(1, &barrier);
 
             commandList->OMSetRenderTargets(1, &rtvHandles[backBufferIndex], false, nullptr);
@@ -398,6 +400,8 @@ float4 main(PSInput input) : SV_TARGET {
             // 次のフレームの準備
             commandAllocator->Reset();
             commandList->Reset(commandAllocator, nullptr);
+
+
         }
     }
 
