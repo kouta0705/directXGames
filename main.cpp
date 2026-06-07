@@ -5,6 +5,8 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <cassert>
+#include <cmath>
+#include <chrono>
 
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler.lib")
@@ -13,13 +15,9 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
-
-
-
 #include "externals/imgui/imgui.h"
 #include "externals/imgui/imgui_impl_win32.h"
 #include "externals/imgui/imgui_impl_dx12.h"
-
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -48,6 +46,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
+
+// ★ 16バイトアライメントの行列構造体
+struct Matrix4x4 {
+    float m[4][4];
+};
+
+// ★ Y軸回転行列を生成
+Matrix4x4 MakeRotationY(float angle) {
+    float c = cosf(angle);
+    float s = sinf(angle);
+    Matrix4x4 mat{};
+    mat.m[0][0] = c;  mat.m[0][1] = 0; mat.m[0][2] = s; mat.m[0][3] = 0;
+    mat.m[1][0] = 0;  mat.m[1][1] = 1; mat.m[1][2] = 0; mat.m[1][3] = 0;
+    mat.m[2][0] = -s;  mat.m[2][1] = 0; mat.m[2][2] = c; mat.m[2][3] = 0;
+    mat.m[3][0] = 0;  mat.m[3][1] = 0; mat.m[3][2] = 0; mat.m[3][3] = 1;
+    return mat;
+}
+
+// ★ 定数バッファ用構造体（256バイトアライメント必須）
+struct alignas(256) ConstantBufferData {
+    Matrix4x4 worldMatrix;
+};
 
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HRESULT hr = S_OK;
@@ -175,8 +195,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     assert(fenceEvent != nullptr);
 
-    // シェーダー（元のコードそのまま）
+    // ★ 変換行列を使う頂点シェーダー
     const char* vsCode = R"(
+cbuffer TransformCB : register(b0) {
+    float4x4 worldMatrix;
+};
 struct VSInput {
     float4 pos : POSITION;
     float4 color : COLOR;
@@ -187,11 +210,12 @@ struct VSOutput {
 };
 VSOutput main(VSInput input) {
     VSOutput output;
-    output.pos = input.pos;
+    output.pos = mul(input.pos, worldMatrix);
     output.color = input.color;
     return output;
 }
 )";
+
     const char* psCode = R"(
 struct PSInput {
     float4 pos : SV_POSITION;
@@ -219,10 +243,19 @@ float4 main(PSInput input) : SV_TARGET {
         assert(false);
     }
 
-    // ルートシグネチャ（元のコードそのまま）
+    // ★ ルートシグネチャに定数バッファ(b0)を追加
     ID3D12RootSignature* rootSignature = nullptr;
+    D3D12_ROOT_PARAMETER rootParam{};
+    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParam.Descriptor.ShaderRegister = 0; // b0
+    rootParam.Descriptor.RegisterSpace = 0;
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
     D3D12_ROOT_SIGNATURE_DESC rootSigDesc{};
+    rootSigDesc.NumParameters = 1;
+    rootSigDesc.pParameters = &rootParam;
     rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
     ID3DBlob* sigBlob = nullptr;
     hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errorBlob);
     assert(SUCCEEDED(hr));
@@ -230,13 +263,11 @@ float4 main(PSInput input) : SV_TARGET {
     assert(SUCCEEDED(hr));
     sigBlob->Release();
 
-    // インプットレイアウト（元のコードそのまま）
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 
-    // PSO（元のコードそのまま）
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
     psoDesc.pRootSignature = rootSignature;
     psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
@@ -257,7 +288,6 @@ float4 main(PSInput input) : SV_TARGET {
     hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
     assert(SUCCEEDED(hr));
 
-    // 頂点バッファ（Mapしたまま保持）
     struct Vertex { float pos[4]; float color[4]; };
     Vertex vertices[] = {
         { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
@@ -291,6 +321,25 @@ float4 main(PSInput input) : SV_TARGET {
     vbView.SizeInBytes = vertexBufferSize;
     vbView.StrideInBytes = sizeof(Vertex);
 
+    // ★ 定数バッファの作成（256バイトアライメント）
+    ID3D12Resource* constantBuffer = nullptr;
+    D3D12_HEAP_PROPERTIES cbHeapProps{};
+    cbHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC cbResDesc{};
+    cbResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    cbResDesc.Width = sizeof(ConstantBufferData); // alignas(256)で自動的に256の倍数
+    cbResDesc.Height = 1;
+    cbResDesc.DepthOrArraySize = 1;
+    cbResDesc.MipLevels = 1;
+    cbResDesc.SampleDesc.Count = 1;
+    cbResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = device->CreateCommittedResource(&cbHeapProps, D3D12_HEAP_FLAG_NONE, &cbResDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&constantBuffer));
+    assert(SUCCEEDED(hr));
+
+    ConstantBufferData* mappedCB = nullptr;
+    constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedCB));
+
     D3D12_VIEWPORT viewport{};
     viewport.Width = static_cast<float>(kClientWidth);
     viewport.Height = static_cast<float>(kClientHeight);
@@ -299,7 +348,6 @@ float4 main(PSInput input) : SV_TARGET {
     scissorRect.right = kClientWidth;
     scissorRect.bottom = kClientHeight;
 
-    // ImGui用SRVヒープ
     ID3D12DescriptorHeap* srvDescriptorHeap = nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -308,7 +356,6 @@ float4 main(PSInput input) : SV_TARGET {
     hr = device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&srvDescriptorHeap));
     assert(SUCCEEDED(hr));
 
-    // ImGui初期化
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -322,6 +369,12 @@ float4 main(PSInput input) : SV_TARGET {
     );
 
     float triangleColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    // ★ 回転速度をImGuiで調整できるようにする
+    float rotationSpeed = 1.0f;
+    float rotationAngle = 0.0f;
+
+    auto startTime = std::chrono::steady_clock::now();
+    auto prevTime = startTime;
 
     MSG msg{};
     while (msg.message != WM_QUIT) {
@@ -330,19 +383,30 @@ float4 main(PSInput input) : SV_TARGET {
             DispatchMessage(&msg);
         }
         else {
-            // ImGuiフレーム開始
+            // ★ デルタタイム計算
+            auto now = std::chrono::steady_clock::now();
+            float deltaTime = std::chrono::duration<float>(now - prevTime).count();
+            prevTime = now;
+
+            // ★ 角度を毎フレーム進める
+            rotationAngle += rotationSpeed * deltaTime;
+
             ImGui_ImplDX12_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
 
-            // ImGui UI
-            ImGui::Begin("Triangle Color");
+            ImGui::Begin("Triangle Settings");
             ImGui::ColorEdit4("Color", triangleColor);
+            ImGui::SliderFloat("Rotation Speed", &rotationSpeed, -5.0f, 5.0f);
+            ImGui::Text("Angle: %.2f rad", rotationAngle);
             ImGui::End();
 
             ImGui::Render();
 
-            // 頂点カラーを毎フレーム更新
+            // ★ 定数バッファに回転行列を書き込む
+            mappedCB->worldMatrix = MakeRotationY(rotationAngle);
+
+            // 頂点カラー更新
             for (int i = 0; i < 3; i++) {
                 mappedVertices[i].color[0] = triangleColor[0];
                 mappedVertices[i].color[1] = triangleColor[1];
@@ -364,12 +428,12 @@ float4 main(PSInput input) : SV_TARGET {
             float clearColor[] = { 0.1f, 0.25f, 0.5f, 1.0f };
             commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
 
-            // SRVヒープをセット（必須）
             ID3D12DescriptorHeap* heaps[] = { srvDescriptorHeap };
             commandList->SetDescriptorHeaps(1, heaps);
 
-            // 三角形描画
             commandList->SetGraphicsRootSignature(rootSignature);
+            // ★ 定数バッファのGPUアドレスをルートパラメータ0番にセット
+            commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
             commandList->SetPipelineState(pipelineState);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissorRect);
@@ -377,7 +441,6 @@ float4 main(PSInput input) : SV_TARGET {
             commandList->IASetVertexBuffers(0, 1, &vbView);
             commandList->DrawInstanced(3, 1, 0, 0);
 
-            // ImGui描画
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -402,11 +465,12 @@ float4 main(PSInput input) : SV_TARGET {
         }
     }
 
-    // ImGui終了処理
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
+    constantBuffer->Unmap(0, nullptr);
+    if (constantBuffer) constantBuffer->Release();
     vertexBuffer->Unmap(0, nullptr);
     if (vertexBuffer) vertexBuffer->Release();
     if (pipelineState) pipelineState->Release();
