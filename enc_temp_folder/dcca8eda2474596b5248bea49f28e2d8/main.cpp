@@ -374,8 +374,6 @@ float4 main(PSInput input) : SV_TARGET {
     float rotationSpeed = 1.0f;
     float rotationAngle = 0.0f;
 
-    bool showDemoWindow = true;
-
     auto startTime = std::chrono::steady_clock::now();
     auto prevTime = startTime;
 
@@ -397,10 +395,6 @@ float4 main(PSInput input) : SV_TARGET {
             ImGui_ImplDX12_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
-
-            if (showDemoWindow) {
-                ImGui::ShowDemoWindow(&showDemoWindow);
-            }
 
             ImGui::Begin("Triangle Settings");
             ImGui::ColorEdit4("Color", triangleColor);
