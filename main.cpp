@@ -379,8 +379,8 @@ float4 main(PSInput input) : SV_TARGET {
     );
 
     float triangleColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    float rotationSpeed = 1.0f;
-    float rotationAngle = 0.0f;
+    float rotationSpeed = 1.00f;
+    float rotationAngle = 0.00f;
 
     bool showDemoWindow = true;
 
