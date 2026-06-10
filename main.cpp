@@ -47,26 +47,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-// ★ 16バイトアライメントの行列構造体
 struct Matrix4x4 {
     float m[4][4];
 };
 
-// ★ Y軸回転行列を生成
 Matrix4x4 MakeRotationY(float angle) {
     float c = cosf(angle);
     float s = sinf(angle);
     Matrix4x4 mat{};
     mat.m[0][0] = c;  mat.m[0][1] = 0; mat.m[0][2] = s; mat.m[0][3] = 0;
     mat.m[1][0] = 0;  mat.m[1][1] = 1; mat.m[1][2] = 0; mat.m[1][3] = 0;
-    mat.m[2][0] = -s;  mat.m[2][1] = 0; mat.m[2][2] = c; mat.m[2][3] = 0;
+    mat.m[2][0] = -s; mat.m[2][1] = 0; mat.m[2][2] = c; mat.m[2][3] = 0;
     mat.m[3][0] = 0;  mat.m[3][1] = 0; mat.m[3][2] = 0; mat.m[3][3] = 1;
     return mat;
 }
 
-// ★ 定数バッファ用構造体（256バイトアライメント必須）
+// ★★ 変更: worldMatrix に加えて color (float4) を保持するよう拡張
+//    256バイトアライメントは alignas(256) で保証
 struct alignas(256) ConstantBufferData {
-    Matrix4x4 worldMatrix;
+    Matrix4x4 worldMatrix; // b0 / 頂点シェーダー用（変換行列）
+    float     color[4];    // b0 / ピクセルシェーダー用（色情報）
+    // ※ 今回は1つのバッファを b0 に束ね、VS・PS 両方から参照する設計にします。
+    //   ルートシグネチャの ShaderVisibility を ALL に変更することで両シェーダーが参照できます。
 };
 
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
@@ -196,34 +198,37 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     assert(fenceEvent != nullptr);
 
-    // ★ 変換行列を使う頂点シェーダー
+    // ★★ 変更: 頂点シェーダー（b0: worldMatrix）
+    //    頂点カラーは頂点バッファから削除し、ピクセルシェーダーが定数バッファから色を受け取る
     const char* vsCode = R"(
 cbuffer TransformCB : register(b0) {
     float4x4 worldMatrix;
+    float4   color;       // 構造体に合わせて宣言するが VS では使わない
 };
 struct VSInput {
     float4 pos : POSITION;
-    float4 color : COLOR;
 };
 struct VSOutput {
     float4 pos : SV_POSITION;
-    float4 color : COLOR;
 };
 VSOutput main(VSInput input) {
     VSOutput output;
     output.pos = mul(input.pos, worldMatrix);
-    output.color = input.color;
     return output;
 }
 )";
 
+    // ★★ 変更: ピクセルシェーダーが同じ b0 から color を受け取る
     const char* psCode = R"(
+cbuffer TransformCB : register(b0) {
+    float4x4 worldMatrix; // PS では使わないが、オフセットを合わせるために宣言する
+    float4   color;
+};
 struct PSInput {
     float4 pos : SV_POSITION;
-    float4 color : COLOR;
 };
 float4 main(PSInput input) : SV_TARGET {
-    return input.color;
+    return color;
 }
 )";
 
@@ -244,13 +249,14 @@ float4 main(PSInput input) : SV_TARGET {
         assert(false);
     }
 
-    // ★ ルートシグネチャに定数バッファ(b0)を追加
+    // ★★ 変更: ShaderVisibility を ALL に変更
+    //    → VS と PS の両方が同じ b0 バッファを参照できる
     ID3D12RootSignature* rootSignature = nullptr;
     D3D12_ROOT_PARAMETER rootParam{};
     rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rootParam.Descriptor.ShaderRegister = 0; // b0
     rootParam.Descriptor.RegisterSpace = 0;
-    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL; // ★★ VERTEX → ALL
 
     D3D12_ROOT_SIGNATURE_DESC rootSigDesc{};
     rootSigDesc.NumParameters = 1;
@@ -264,9 +270,10 @@ float4 main(PSInput input) : SV_TARGET {
     assert(SUCCEEDED(hr));
     sigBlob->Release();
 
+    // ★★ 変更: 頂点バッファから COLOR セマンティクスを削除
+    //    色は ConstantBuffer 経由で渡すので頂点ごとの色情報は不要
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
@@ -289,11 +296,12 @@ float4 main(PSInput input) : SV_TARGET {
     hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
     assert(SUCCEEDED(hr));
 
-    struct Vertex { float pos[4]; float color[4]; };
+    // ★★ 変更: 頂点バッファから COLOR を削除（位置情報のみ）
+    struct Vertex { float pos[4]; };
     Vertex vertices[] = {
-        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
-        { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
-        { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
+        { {  0.0f,  0.5f, 0.0f, 1.0f } },
+        { {  0.5f, -0.5f, 0.0f, 1.0f } },
+        { { -0.5f, -0.5f, 0.0f, 1.0f } },
     };
     UINT vertexBufferSize = sizeof(vertices);
 
@@ -316,19 +324,20 @@ float4 main(PSInput input) : SV_TARGET {
     Vertex* mappedVertices = nullptr;
     vertexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedVertices));
     memcpy(mappedVertices, vertices, vertexBufferSize);
+    // ★★ 変更: 頂点カラーを毎フレーム書き換えるコードは削除
 
     D3D12_VERTEX_BUFFER_VIEW vbView{};
     vbView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
     vbView.SizeInBytes = vertexBufferSize;
     vbView.StrideInBytes = sizeof(Vertex);
 
-    // ★ 定数バッファの作成（256バイトアライメント）
+    // 定数バッファの作成
     ID3D12Resource* constantBuffer = nullptr;
     D3D12_HEAP_PROPERTIES cbHeapProps{};
     cbHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC cbResDesc{};
     cbResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    cbResDesc.Width = sizeof(ConstantBufferData); // alignas(256)で自動的に256の倍数
+    cbResDesc.Width = sizeof(ConstantBufferData); // alignas(256) により 256 の倍数が保証される
     cbResDesc.Height = 1;
     cbResDesc.DepthOrArraySize = 1;
     cbResDesc.MipLevels = 1;
@@ -370,7 +379,6 @@ float4 main(PSInput input) : SV_TARGET {
     );
 
     float triangleColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    // ★ 回転速度をImGuiで調整できるようにする
     float rotationSpeed = 1.0f;
     float rotationAngle = 0.0f;
 
@@ -386,12 +394,10 @@ float4 main(PSInput input) : SV_TARGET {
             DispatchMessage(&msg);
         }
         else {
-            // ★ デルタタイム計算
             auto now = std::chrono::steady_clock::now();
             float deltaTime = std::chrono::duration<float>(now - prevTime).count();
             prevTime = now;
 
-            // ★ 角度を毎フレーム進める
             rotationAngle += rotationSpeed * deltaTime;
 
             ImGui_ImplDX12_NewFrame();
@@ -410,16 +416,13 @@ float4 main(PSInput input) : SV_TARGET {
 
             ImGui::Render();
 
-            // ★ 定数バッファに回転行列を書き込む
+            // ★★ 変更: worldMatrix と color の両方を定数バッファ経由で GPU に渡す
             mappedCB->worldMatrix = MakeRotationY(rotationAngle);
-
-            // 頂点カラー更新
-            for (int i = 0; i < 3; i++) {
-                mappedVertices[i].color[0] = triangleColor[0];
-                mappedVertices[i].color[1] = triangleColor[1];
-                mappedVertices[i].color[2] = triangleColor[2];
-                mappedVertices[i].color[3] = triangleColor[3];
-            }
+            mappedCB->color[0] = triangleColor[0]; // R
+            mappedCB->color[1] = triangleColor[1]; // G
+            mappedCB->color[2] = triangleColor[2]; // B
+            mappedCB->color[3] = triangleColor[3]; // A
+            // ★★ 変更: 頂点バッファの色書き換えは不要になったため削除
 
             UINT backBufferIndex = swapChain->GetCurrentBackBufferIndex();
 
@@ -440,7 +443,6 @@ float4 main(PSInput input) : SV_TARGET {
             commandList->SetDescriptorHeaps(1, heaps);
 
             commandList->SetGraphicsRootSignature(rootSignature);
-            // ★ 定数バッファのGPUアドレスをルートパラメータ0番にセット
             commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
             commandList->SetPipelineState(pipelineState);
             commandList->RSSetViewports(1, &viewport);
@@ -470,8 +472,6 @@ float4 main(PSInput input) : SV_TARGET {
 
             commandAllocator->Reset();
             commandList->Reset(commandAllocator, nullptr);
-
-
         }
     }
 
