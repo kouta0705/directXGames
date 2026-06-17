@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <format>
+#include <vector>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <cassert>
@@ -67,6 +68,11 @@ Matrix4x4 MakeRotationY(float angle) {
 // ★ 定数バッファ用構造体（256バイトアライメント必須）
 struct alignas(256) ConstantBufferData {
     Matrix4x4 worldMatrix;
+};
+
+// ★ マテリアル用の定数バッファ（色のみ、デフォルトは白）
+struct alignas(256) MaterialCBData {
+    float color[4];
 };
 
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
@@ -196,7 +202,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     assert(fenceEvent != nullptr);
 
-    // ★ 変換行列を使う頂点シェーダー
+    // ★ 変換行列・テクスチャを使う頂点シェーダー
     const char* vsCode = R"(
 cbuffer TransformCB : register(b0) {
     float4x4 worldMatrix;
@@ -204,26 +210,37 @@ cbuffer TransformCB : register(b0) {
 struct VSInput {
     float4 pos : POSITION;
     float4 color : COLOR;
+    float2 uv : TEXCOORD0;
 };
 struct VSOutput {
     float4 pos : SV_POSITION;
     float4 color : COLOR;
+    float2 uv : TEXCOORD0;
 };
 VSOutput main(VSInput input) {
     VSOutput output;
     output.pos = mul(input.pos, worldMatrix);
     output.color = input.color;
+    output.uv = input.uv;
     return output;
 }
 )";
 
+    // ★ テクスチャ＋マテリアルカラーを乗算するピクセルシェーダー
     const char* psCode = R"(
+cbuffer MaterialCB : register(b1) {
+    float4 materialColor;
+};
+Texture2D<float4> gTexture : register(t0);
+SamplerState gSampler : register(s0);
 struct PSInput {
     float4 pos : SV_POSITION;
     float4 color : COLOR;
+    float2 uv : TEXCOORD0;
 };
 float4 main(PSInput input) : SV_TARGET {
-    return input.color;
+    float4 texColor = gTexture.Sample(gSampler, input.uv);
+    return texColor * materialColor * input.color;
 }
 )";
 
@@ -244,17 +261,47 @@ float4 main(PSInput input) : SV_TARGET {
         assert(false);
     }
 
-    // ★ ルートシグネチャに定数バッファ(b0)を追加
+    // ★ ルートシグネチャ：b0(World行列/VS), b1(マテリアルカラー/PS), t0(テクスチャ/PS) + 静的サンプラー
     ID3D12RootSignature* rootSignature = nullptr;
-    D3D12_ROOT_PARAMETER rootParam{};
-    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParam.Descriptor.ShaderRegister = 0; // b0
-    rootParam.Descriptor.RegisterSpace = 0;
-    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    D3D12_DESCRIPTOR_RANGE srvRange{};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 1;
+    srvRange.BaseShaderRegister = 0;
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER rootParams[3]{};
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[0].Descriptor.ShaderRegister = 0; // b0 (World行列)
+    rootParams[0].Descriptor.RegisterSpace = 0;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[1].Descriptor.ShaderRegister = 1; // b1 (マテリアルカラー)
+    rootParams[1].Descriptor.RegisterSpace = 0;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[2].DescriptorTable.pDescriptorRanges = &srvRange;
+    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC staticSampler{};
+    staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    staticSampler.ShaderRegister = 0; // s0
+    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rootSigDesc{};
-    rootSigDesc.NumParameters = 1;
-    rootSigDesc.pParameters = &rootParam;
+    rootSigDesc.NumParameters = _countof(rootParams);
+    rootSigDesc.pParameters = rootParams;
+    rootSigDesc.NumStaticSamplers = 1;
+    rootSigDesc.pStaticSamplers = &staticSampler;
     rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ID3DBlob* sigBlob = nullptr;
@@ -264,9 +311,11 @@ float4 main(PSInput input) : SV_TARGET {
     assert(SUCCEEDED(hr));
     sigBlob->Release();
 
+    // ★ TEXCOORDを追加した入力レイアウト
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
@@ -289,11 +338,12 @@ float4 main(PSInput input) : SV_TARGET {
     hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
     assert(SUCCEEDED(hr));
 
-    struct Vertex { float pos[4]; float color[4]; };
+    // ★ 頂点カラーは常に白(1,1,1,1)にしておき、見た目の色味はマテリアルカラーで制御する
+    struct Vertex { float pos[4]; float color[4]; float uv[2]; };
     Vertex vertices[] = {
-        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
-        { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
-        { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } },
+        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
+        { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
+        { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } },
     };
     UINT vertexBufferSize = sizeof(vertices);
 
@@ -341,6 +391,29 @@ float4 main(PSInput input) : SV_TARGET {
     ConstantBufferData* mappedCB = nullptr;
     constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedCB));
 
+    // ★ マテリアルカラー用の定数バッファ（デフォルトは白）
+    ID3D12Resource* materialBuffer = nullptr;
+    D3D12_HEAP_PROPERTIES matHeapProps{};
+    matHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC matResDesc{};
+    matResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    matResDesc.Width = sizeof(MaterialCBData);
+    matResDesc.Height = 1;
+    matResDesc.DepthOrArraySize = 1;
+    matResDesc.MipLevels = 1;
+    matResDesc.SampleDesc.Count = 1;
+    matResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = device->CreateCommittedResource(&matHeapProps, D3D12_HEAP_FLAG_NONE, &matResDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&materialBuffer));
+    assert(SUCCEEDED(hr));
+
+    MaterialCBData* mappedMaterial = nullptr;
+    materialBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedMaterial));
+    mappedMaterial->color[0] = 1.0f;
+    mappedMaterial->color[1] = 1.0f;
+    mappedMaterial->color[2] = 1.0f;
+    mappedMaterial->color[3] = 1.0f;
+
     D3D12_VIEWPORT viewport{};
     viewport.Width = static_cast<float>(kClientWidth);
     viewport.Height = static_cast<float>(kClientHeight);
@@ -349,13 +422,129 @@ float4 main(PSInput input) : SV_TARGET {
     scissorRect.right = kClientWidth;
     scissorRect.bottom = kClientHeight;
 
+    // ★ テクスチャ用リソースの作成（手続き的なチェッカー柄、256x256 RGBA8）
+    const UINT kTexWidth = 256;
+    const UINT kTexHeight = 256;
+    const UINT kCellSize = 32;
+    std::vector<uint8_t> textureData(static_cast<size_t>(kTexWidth) * kTexHeight * 4);
+    for (UINT y = 0; y < kTexHeight; ++y) {
+        for (UINT x = 0; x < kTexWidth; ++x) {
+            bool checker = ((x / kCellSize) % 2) ^ ((y / kCellSize) % 2);
+            uint8_t v = checker ? 255 : 180;
+            size_t idx = (static_cast<size_t>(y) * kTexWidth + x) * 4;
+            textureData[idx + 0] = v;
+            textureData[idx + 1] = v;
+            textureData[idx + 2] = v;
+            textureData[idx + 3] = 255;
+        }
+    }
+
+    D3D12_HEAP_PROPERTIES texHeapProps{};
+    texHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC texResDesc{};
+    texResDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texResDesc.Width = kTexWidth;
+    texResDesc.Height = kTexHeight;
+    texResDesc.DepthOrArraySize = 1;
+    texResDesc.MipLevels = 1;
+    texResDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texResDesc.SampleDesc.Count = 1;
+    texResDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    ID3D12Resource* textureResource = nullptr;
+    hr = device->CreateCommittedResource(&texHeapProps, D3D12_HEAP_FLAG_NONE, &texResDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&textureResource));
+    assert(SUCCEEDED(hr));
+
+    UINT64 uploadBufferSize = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT texFootprint{};
+    device->GetCopyableFootprints(&texResDesc, 0, 1, 0, &texFootprint, nullptr, nullptr, &uploadBufferSize);
+
+    ID3D12Resource* textureUploadHeap = nullptr;
+    D3D12_HEAP_PROPERTIES texUploadHeapProps{};
+    texUploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC texUploadResDesc{};
+    texUploadResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    texUploadResDesc.Width = uploadBufferSize;
+    texUploadResDesc.Height = 1;
+    texUploadResDesc.DepthOrArraySize = 1;
+    texUploadResDesc.MipLevels = 1;
+    texUploadResDesc.SampleDesc.Count = 1;
+    texUploadResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = device->CreateCommittedResource(&texUploadHeapProps, D3D12_HEAP_FLAG_NONE, &texUploadResDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&textureUploadHeap));
+    assert(SUCCEEDED(hr));
+
+    uint8_t* mappedUpload = nullptr;
+    textureUploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&mappedUpload));
+    for (UINT y = 0; y < kTexHeight; ++y) {
+        memcpy(mappedUpload + y * texFootprint.Footprint.RowPitch,
+            textureData.data() + static_cast<size_t>(y) * kTexWidth * 4, static_cast<size_t>(kTexWidth) * 4);
+    }
+    textureUploadHeap->Unmap(0, nullptr);
+
+    // ★ コマンドリストを開いてテクスチャをアップロードする
+    commandList->Reset(commandAllocator, nullptr);
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = textureResource;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = textureUploadHeap;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = texFootprint;
+        commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        D3D12_RESOURCE_BARRIER texBarrier{};
+        texBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        texBarrier.Transition.pResource = textureResource;
+        texBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        texBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        texBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &texBarrier);
+    }
+    commandList->Close();
+    {
+        ID3D12CommandList* initCommandLists[] = { commandList };
+        commandQueue->ExecuteCommandLists(1, initCommandLists);
+    }
+    fenceValue++;
+    commandQueue->Signal(fence, fenceValue);
+    if (fence->GetCompletedValue() < fenceValue) {
+        fence->SetEventOnCompletion(fenceValue, fenceEvent);
+        WaitForSingleObject(fenceEvent, INFINITE);
+    }
+    textureUploadHeap->Release();
+    textureUploadHeap = nullptr;
+
+    // ★ メインループの先頭で開いた状態になるよう、ここでReset
+    commandAllocator->Reset();
+    commandList->Reset(commandAllocator, nullptr);
+
+    // ★ SRVヒープ：0番=自作テクスチャ、1番=ImGuiフォント
     ID3D12DescriptorHeap* srvDescriptorHeap = nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.NumDescriptors = 1;
+    srvHeapDesc.NumDescriptors = 2;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&srvDescriptorHeap));
     assert(SUCCEEDED(hr));
+
+    UINT srvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHeapCpuStart = srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE srvHeapGpuStart = srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = texResDesc.Format;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(textureResource, &srvDesc, srvHeapCpuStart);
+    D3D12_GPU_DESCRIPTOR_HANDLE textureGpuHandle = srvHeapGpuStart; // スロット0
+
+    D3D12_CPU_DESCRIPTOR_HANDLE imguiFontCpuHandle{ srvHeapCpuStart.ptr + srvDescriptorSize };
+    D3D12_GPU_DESCRIPTOR_HANDLE imguiFontGpuHandle{ srvHeapGpuStart.ptr + srvDescriptorSize };
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -365,11 +554,12 @@ float4 main(PSInput input) : SV_TARGET {
         device, 2,
         DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         srvDescriptorHeap,
-        srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
-        srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart()
+        imguiFontCpuHandle,
+        imguiFontGpuHandle
     );
 
-    float triangleColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    // ★ マテリアルカラー（デフォルト白）。ImGuiで変更可能
+    float materialColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     // ★ 回転速度をImGuiで調整できるようにする
     float rotationSpeed = 1.0f;
     float rotationAngle = 0.0f;
@@ -403,7 +593,7 @@ float4 main(PSInput input) : SV_TARGET {
             }
 
             ImGui::Begin("Triangle Settings");
-            ImGui::ColorEdit4("Color", triangleColor);
+            ImGui::ColorEdit4("Material Color", materialColor);
             ImGui::SliderFloat("Rotation Speed", &rotationSpeed, -5.0f, 5.0f);
             ImGui::Text("Angle: %.2f rad", rotationAngle);
             ImGui::End();
@@ -413,13 +603,11 @@ float4 main(PSInput input) : SV_TARGET {
             // ★ 定数バッファに回転行列を書き込む
             mappedCB->worldMatrix = MakeRotationY(rotationAngle);
 
-            // 頂点カラー更新
-            for (int i = 0; i < 3; i++) {
-                mappedVertices[i].color[0] = triangleColor[0];
-                mappedVertices[i].color[1] = triangleColor[1];
-                mappedVertices[i].color[2] = triangleColor[2];
-                mappedVertices[i].color[3] = triangleColor[3];
-            }
+            // ★ マテリアルカラーを定数バッファへ書き込む（頂点カラーは常に白のまま）
+            mappedMaterial->color[0] = materialColor[0];
+            mappedMaterial->color[1] = materialColor[1];
+            mappedMaterial->color[2] = materialColor[2];
+            mappedMaterial->color[3] = materialColor[3];
 
             UINT backBufferIndex = swapChain->GetCurrentBackBufferIndex();
 
@@ -440,8 +628,10 @@ float4 main(PSInput input) : SV_TARGET {
             commandList->SetDescriptorHeaps(1, heaps);
 
             commandList->SetGraphicsRootSignature(rootSignature);
-            // ★ 定数バッファのGPUアドレスをルートパラメータ0番にセット
+            // ★ World行列・マテリアルカラー・テクスチャをそれぞれのルートパラメータにセット
             commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
+            commandList->SetGraphicsRootConstantBufferView(1, materialBuffer->GetGPUVirtualAddress());
+            commandList->SetGraphicsRootDescriptorTable(2, textureGpuHandle);
             commandList->SetPipelineState(pipelineState);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissorRect);
@@ -479,6 +669,9 @@ float4 main(PSInput input) : SV_TARGET {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
+    materialBuffer->Unmap(0, nullptr);
+    if (materialBuffer) materialBuffer->Release();
+    if (textureResource) textureResource->Release();
     constantBuffer->Unmap(0, nullptr);
     if (constantBuffer) constantBuffer->Release();
     vertexBuffer->Unmap(0, nullptr);
