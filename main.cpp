@@ -16,11 +16,15 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
+#ifdef USE_IMGUI
 #include "externals/imgui/imgui.h"
 #include "externals/imgui/imgui_impl_win32.h"
 #include "externals/imgui/imgui_impl_dx12.h"
+#endif
 
+#ifdef USE_IMGUI
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#endif
 
 std::wstring ConvertString(const std::string& str) {
     if (str.empty()) return std::wstring();
@@ -43,7 +47,9 @@ std::string ConvertString(const std::wstring& wstr) {
 void Log(const std::string& message) { OutputDebugStringA(message.c_str()); }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+#ifdef USE_IMGUI
     if (ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam)) return true;
+#endif
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
@@ -60,8 +66,16 @@ Matrix4x4 MakeRotationY(float angle) {
     Matrix4x4 mat{};
     mat.m[0][0] = c;  mat.m[0][1] = 0; mat.m[0][2] = s; mat.m[0][3] = 0;
     mat.m[1][0] = 0;  mat.m[1][1] = 1; mat.m[1][2] = 0; mat.m[1][3] = 0;
-    mat.m[2][0] = -s;  mat.m[2][1] = 0; mat.m[2][2] = c; mat.m[2][3] = 0;
+    mat.m[2][0] = -s; mat.m[2][1] = 0; mat.m[2][2] = c; mat.m[2][3] = 0;
     mat.m[3][0] = 0;  mat.m[3][1] = 0; mat.m[3][2] = 0; mat.m[3][3] = 1;
+    return mat;
+}
+
+// ★ 平行移動行列を生成
+Matrix4x4 MakeTranslation(float x, float y, float z) {
+    Matrix4x4 mat{};
+    mat.m[0][0] = 1; mat.m[1][1] = 1; mat.m[2][2] = 1; mat.m[3][3] = 1;
+    mat.m[3][0] = x; mat.m[3][1] = y; mat.m[3][2] = z;
     return mat;
 }
 
@@ -73,6 +87,11 @@ struct alignas(256) ConstantBufferData {
 // ★ マテリアル用の定数バッファ（色のみ、デフォルトは白）
 struct alignas(256) MaterialCBData {
     float color[4];
+};
+
+// ★ スプライト用 Transform（CPUで保持）
+struct SpriteTransform {
+    float translate[3] = { 0.0f, 0.0f, 0.0f };
 };
 
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
@@ -338,8 +357,10 @@ float4 main(PSInput input) : SV_TARGET {
     hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
     assert(SUCCEEDED(hr));
 
-    // ★ 頂点カラーは常に白(1,1,1,1)にしておき、見た目の色味はマテリアルカラーで制御する
+    // ★ 頂点カラーは常に白(1,1,1,1)
     struct Vertex { float pos[4]; float color[4]; float uv[2]; };
+
+    // ★ 既存の大きい三角形
     Vertex vertices[] = {
         { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
         { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
@@ -347,22 +368,46 @@ float4 main(PSInput input) : SV_TARGET {
     };
     UINT vertexBufferSize = sizeof(vertices);
 
-    D3D12_HEAP_PROPERTIES heapProps{};
-    heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC resDesc{};
-    resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    resDesc.Width = vertexBufferSize;
-    resDesc.Height = 1;
-    resDesc.DepthOrArraySize = 1;
-    resDesc.MipLevels = 1;
-    resDesc.SampleDesc.Count = 1;
-    resDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // ★ 既存の小さい三角形（左下・右下のZ=0.1f）
+    Vertex verticesSmall[] = {
+        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
+        { {  0.5f, -0.5f, 0.1f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
+        { { -0.5f, -0.5f, 0.1f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } },
+    };
+    UINT vertexBufferSizeSmall = sizeof(verticesSmall);
 
-    ID3D12Resource* vertexBuffer = nullptr;
-    hr = device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vertexBuffer));
-    assert(SUCCEEDED(hr));
+    // ★ スプライト用頂点（四角形 = 2Triangle、NDC空間で幅0.4・高さ0.4のQuad）
+    //    左上(-0.2, 0.2) 右上(0.2, 0.2) 左下(-0.2,-0.2) 右下(0.2,-0.2)
+    Vertex verticesSprite[] = {
+        { { -0.2f,  0.2f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 0.0f } }, // 左上
+        { {  0.2f,  0.2f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 0.0f } }, // 右上
+        { { -0.2f, -0.2f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } }, // 左下
+        { {  0.2f,  0.2f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 0.0f } }, // 右上
+        { {  0.2f, -0.2f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } }, // 右下
+        { { -0.2f, -0.2f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } }, // 左下
+    };
+    UINT vertexBufferSizeSprite = sizeof(verticesSprite);
 
+    auto CreateUploadBuffer = [&](UINT64 size) -> ID3D12Resource* {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* res = nullptr;
+        HRESULT r = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&res));
+        assert(SUCCEEDED(r));
+        return res;
+        };
+
+    // ★ 既存 頂点バッファ
+    ID3D12Resource* vertexBuffer = CreateUploadBuffer(vertexBufferSize);
     Vertex* mappedVertices = nullptr;
     vertexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedVertices));
     memcpy(mappedVertices, vertices, vertexBufferSize);
@@ -372,41 +417,40 @@ float4 main(PSInput input) : SV_TARGET {
     vbView.SizeInBytes = vertexBufferSize;
     vbView.StrideInBytes = sizeof(Vertex);
 
-    // ★ 定数バッファの作成（256バイトアライメント）
-    ID3D12Resource* constantBuffer = nullptr;
-    D3D12_HEAP_PROPERTIES cbHeapProps{};
-    cbHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC cbResDesc{};
-    cbResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    cbResDesc.Width = sizeof(ConstantBufferData); // alignas(256)で自動的に256の倍数
-    cbResDesc.Height = 1;
-    cbResDesc.DepthOrArraySize = 1;
-    cbResDesc.MipLevels = 1;
-    cbResDesc.SampleDesc.Count = 1;
-    cbResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    hr = device->CreateCommittedResource(&cbHeapProps, D3D12_HEAP_FLAG_NONE, &cbResDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&constantBuffer));
-    assert(SUCCEEDED(hr));
+    // ★ 既存 小さい三角形 頂点バッファ
+    ID3D12Resource* vertexBufferSmall = CreateUploadBuffer(vertexBufferSizeSmall);
+    Vertex* mappedVerticesSmall = nullptr;
+    vertexBufferSmall->Map(0, nullptr, reinterpret_cast<void**>(&mappedVerticesSmall));
+    memcpy(mappedVerticesSmall, verticesSmall, vertexBufferSizeSmall);
 
+    D3D12_VERTEX_BUFFER_VIEW vbViewSmall{};
+    vbViewSmall.BufferLocation = vertexBufferSmall->GetGPUVirtualAddress();
+    vbViewSmall.SizeInBytes = vertexBufferSizeSmall;
+    vbViewSmall.StrideInBytes = sizeof(Vertex);
+
+    // ★ スプライト用 VertexResource & VBV（別途用意）
+    ID3D12Resource* vertexBufferSprite = CreateUploadBuffer(vertexBufferSizeSprite);
+    Vertex* mappedVerticesSprite = nullptr;
+    vertexBufferSprite->Map(0, nullptr, reinterpret_cast<void**>(&mappedVerticesSprite));
+    memcpy(mappedVerticesSprite, verticesSprite, vertexBufferSizeSprite);
+
+    D3D12_VERTEX_BUFFER_VIEW vbViewSprite{};
+    vbViewSprite.BufferLocation = vertexBufferSprite->GetGPUVirtualAddress();
+    vbViewSprite.SizeInBytes = vertexBufferSizeSprite;
+    vbViewSprite.StrideInBytes = sizeof(Vertex);
+
+    // ★ 既存 三角形用 定数バッファ（回転行列）
+    ID3D12Resource* constantBuffer = CreateUploadBuffer(sizeof(ConstantBufferData));
     ConstantBufferData* mappedCB = nullptr;
     constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedCB));
 
-    // ★ マテリアルカラー用の定数バッファ（デフォルトは白）
-    ID3D12Resource* materialBuffer = nullptr;
-    D3D12_HEAP_PROPERTIES matHeapProps{};
-    matHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC matResDesc{};
-    matResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    matResDesc.Width = sizeof(MaterialCBData);
-    matResDesc.Height = 1;
-    matResDesc.DepthOrArraySize = 1;
-    matResDesc.MipLevels = 1;
-    matResDesc.SampleDesc.Count = 1;
-    matResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    hr = device->CreateCommittedResource(&matHeapProps, D3D12_HEAP_FLAG_NONE, &matResDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&materialBuffer));
-    assert(SUCCEEDED(hr));
+    // ★ スプライト用 TransformMatrix CBV（独立した定数バッファ）
+    ID3D12Resource* spriteConstantBuffer = CreateUploadBuffer(sizeof(ConstantBufferData));
+    ConstantBufferData* mappedSpriteCB = nullptr;
+    spriteConstantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedSpriteCB));
 
+    // ★ マテリアルカラー用の定数バッファ（共通・白）
+    ID3D12Resource* materialBuffer = CreateUploadBuffer(sizeof(MaterialCBData));
     MaterialCBData* mappedMaterial = nullptr;
     materialBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedMaterial));
     mappedMaterial->color[0] = 1.0f;
@@ -422,7 +466,7 @@ float4 main(PSInput input) : SV_TARGET {
     scissorRect.right = kClientWidth;
     scissorRect.bottom = kClientHeight;
 
-    // ★ テクスチャ用リソースの作成（手続き的なチェッカー柄、256x256 RGBA8）
+    // ★ テクスチャ用リソースの作成（チェッカー柄、256x256 RGBA8）
     const UINT kTexWidth = 256;
     const UINT kTexHeight = 256;
     const UINT kCellSize = 32;
@@ -460,21 +504,7 @@ float4 main(PSInput input) : SV_TARGET {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT texFootprint{};
     device->GetCopyableFootprints(&texResDesc, 0, 1, 0, &texFootprint, nullptr, nullptr, &uploadBufferSize);
 
-    ID3D12Resource* textureUploadHeap = nullptr;
-    D3D12_HEAP_PROPERTIES texUploadHeapProps{};
-    texUploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC texUploadResDesc{};
-    texUploadResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    texUploadResDesc.Width = uploadBufferSize;
-    texUploadResDesc.Height = 1;
-    texUploadResDesc.DepthOrArraySize = 1;
-    texUploadResDesc.MipLevels = 1;
-    texUploadResDesc.SampleDesc.Count = 1;
-    texUploadResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    hr = device->CreateCommittedResource(&texUploadHeapProps, D3D12_HEAP_FLAG_NONE, &texUploadResDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&textureUploadHeap));
-    assert(SUCCEEDED(hr));
-
+    ID3D12Resource* textureUploadHeap = CreateUploadBuffer(uploadBufferSize);
     uint8_t* mappedUpload = nullptr;
     textureUploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&mappedUpload));
     for (UINT y = 0; y < kTexHeight; ++y) {
@@ -483,7 +513,7 @@ float4 main(PSInput input) : SV_TARGET {
     }
     textureUploadHeap->Unmap(0, nullptr);
 
-    // ★ コマンドリストを開いてテクスチャをアップロードする
+    // ★ テクスチャアップロード
     commandList->Reset(commandAllocator, nullptr);
     {
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -518,15 +548,18 @@ float4 main(PSInput input) : SV_TARGET {
     textureUploadHeap->Release();
     textureUploadHeap = nullptr;
 
-    // ★ メインループの先頭で開いた状態になるよう、ここでReset
     commandAllocator->Reset();
     commandList->Reset(commandAllocator, nullptr);
 
-    // ★ SRVヒープ：0番=自作テクスチャ、1番=ImGuiフォント
+    // ★ SRVヒープ：0番=テクスチャ、1番=ImGuiフォント
     ID3D12DescriptorHeap* srvDescriptorHeap = nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+#ifdef USE_IMGUI
     srvHeapDesc.NumDescriptors = 2;
+#else
+    srvHeapDesc.NumDescriptors = 1;
+#endif
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&srvDescriptorHeap));
     assert(SUCCEEDED(hr));
@@ -541,11 +574,14 @@ float4 main(PSInput input) : SV_TARGET {
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
     device->CreateShaderResourceView(textureResource, &srvDesc, srvHeapCpuStart);
-    D3D12_GPU_DESCRIPTOR_HANDLE textureGpuHandle = srvHeapGpuStart; // スロット0
+    D3D12_GPU_DESCRIPTOR_HANDLE textureGpuHandle = srvHeapGpuStart;
 
+#ifdef USE_IMGUI
     D3D12_CPU_DESCRIPTOR_HANDLE imguiFontCpuHandle{ srvHeapCpuStart.ptr + srvDescriptorSize };
     D3D12_GPU_DESCRIPTOR_HANDLE imguiFontGpuHandle{ srvHeapGpuStart.ptr + srvDescriptorSize };
+#endif
 
+#ifdef USE_IMGUI
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -557,17 +593,17 @@ float4 main(PSInput input) : SV_TARGET {
         imguiFontCpuHandle,
         imguiFontGpuHandle
     );
+#endif
 
-    // ★ マテリアルカラー（デフォルト白）。ImGuiで変更可能
+    // ★ マテリアルカラー（共通、ImGuiで変更可能）
     float materialColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    // ★ 回転速度をImGuiで調整できるようにする
+    // ★ 三角形の回転
     float rotationSpeed = 1.0f;
     float rotationAngle = 0.0f;
+    // ★ スプライト用 Transform（CPUで保持）
+    SpriteTransform spriteTransform{};
 
-    bool showDemoWindow = true;
-
-    auto startTime = std::chrono::steady_clock::now();
-    auto prevTime = startTime;
+    auto prevTime = std::chrono::steady_clock::now();
 
     MSG msg{};
     while (msg.message != WM_QUIT) {
@@ -576,34 +612,43 @@ float4 main(PSInput input) : SV_TARGET {
             DispatchMessage(&msg);
         }
         else {
-            // ★ デルタタイム計算
             auto now = std::chrono::steady_clock::now();
             float deltaTime = std::chrono::duration<float>(now - prevTime).count();
             prevTime = now;
 
-            // ★ 角度を毎フレーム進める
             rotationAngle += rotationSpeed * deltaTime;
 
+#ifdef USE_IMGUI
             ImGui_ImplDX12_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
 
-            if (showDemoWindow) {
-                ImGui::ShowDemoWindow(&showDemoWindow);
-            }
-
-            ImGui::Begin("Triangle Settings");
+            ImGui::Begin("Settings");
             ImGui::ColorEdit4("Material Color", materialColor);
             ImGui::SliderFloat("Rotation Speed", &rotationSpeed, -5.0f, 5.0f);
             ImGui::Text("Angle: %.2f rad", rotationAngle);
+            ImGui::Separator();
+            // ★ スプライトのTranslateをImGuiで操作
+            ImGui::Text("Sprite Transform");
+            ImGui::SliderFloat("translateX", &spriteTransform.translate[0], -1.0f, 1.0f);
+            ImGui::SliderFloat("translateY", &spriteTransform.translate[1], -1.0f, 1.0f);
+            ImGui::SliderFloat("translateZ", &spriteTransform.translate[2], -1.0f, 1.0f);
             ImGui::End();
 
             ImGui::Render();
+#endif
 
-            // ★ 定数バッファに回転行列を書き込む
+            // ★ 三角形の定数バッファに回転行列を書き込む
             mappedCB->worldMatrix = MakeRotationY(rotationAngle);
 
-            // ★ マテリアルカラーを定数バッファへ書き込む（頂点カラーは常に白のまま）
+            // ★ スプライトの定数バッファにTranslate行列を書き込む
+            mappedSpriteCB->worldMatrix = MakeTranslation(
+                spriteTransform.translate[0],
+                spriteTransform.translate[1],
+                spriteTransform.translate[2]
+            );
+
+            // ★ マテリアルカラーを書き込む
             mappedMaterial->color[0] = materialColor[0];
             mappedMaterial->color[1] = materialColor[1];
             mappedMaterial->color[2] = materialColor[2];
@@ -626,20 +671,31 @@ float4 main(PSInput input) : SV_TARGET {
 
             ID3D12DescriptorHeap* heaps[] = { srvDescriptorHeap };
             commandList->SetDescriptorHeaps(1, heaps);
-
             commandList->SetGraphicsRootSignature(rootSignature);
-            // ★ World行列・マテリアルカラー・テクスチャをそれぞれのルートパラメータにセット
-            commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
             commandList->SetGraphicsRootConstantBufferView(1, materialBuffer->GetGPUVirtualAddress());
             commandList->SetGraphicsRootDescriptorTable(2, textureGpuHandle);
             commandList->SetPipelineState(pipelineState);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissorRect);
             commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+            // ★ 大きい三角形（回転行列CBV）
+            commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
             commandList->IASetVertexBuffers(0, 1, &vbView);
             commandList->DrawInstanced(3, 1, 0, 0);
 
+            // ★ 小さい三角形（同じ回転行列CBV）
+            commandList->IASetVertexBuffers(0, 1, &vbViewSmall);
+            commandList->DrawInstanced(3, 1, 0, 0);
+
+            // ★ スプライト描画（独立したTranslate CBV & VBV）
+            commandList->SetGraphicsRootConstantBufferView(0, spriteConstantBuffer->GetGPUVirtualAddress());
+            commandList->IASetVertexBuffers(0, 1, &vbViewSprite);
+            commandList->DrawInstanced(6, 1, 0, 0);
+
+#ifdef USE_IMGUI
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+#endif
 
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -660,20 +716,26 @@ float4 main(PSInput input) : SV_TARGET {
 
             commandAllocator->Reset();
             commandList->Reset(commandAllocator, nullptr);
-
-
         }
     }
 
+#ifdef USE_IMGUI
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+#endif
 
+    spriteConstantBuffer->Unmap(0, nullptr);
+    if (spriteConstantBuffer) spriteConstantBuffer->Release();
     materialBuffer->Unmap(0, nullptr);
     if (materialBuffer) materialBuffer->Release();
     if (textureResource) textureResource->Release();
     constantBuffer->Unmap(0, nullptr);
     if (constantBuffer) constantBuffer->Release();
+    vertexBufferSprite->Unmap(0, nullptr);
+    if (vertexBufferSprite) vertexBufferSprite->Release();
+    vertexBufferSmall->Unmap(0, nullptr);
+    if (vertexBufferSmall) vertexBufferSmall->Release();
     vertexBuffer->Unmap(0, nullptr);
     if (vertexBuffer) vertexBuffer->Release();
     if (pipelineState) pipelineState->Release();
