@@ -9,12 +9,24 @@
 #include <cmath>
 #include <chrono>
 
-#include <d3dcompiler.h>
-#pragma comment(lib, "d3dcompiler.lib")
 #include <dxgidebug.h>
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+
+// ★ シェーダーコンパイルにはDXC(dxcompiler)を使用する。
+//   float32_t4等のSM6.2明示的精度型を使うため、FXC(D3DCompile)ではなくDXCでコンパイルする。
+#include <dxcapi.h>
+#pragma comment(lib, "dxcompiler.lib")
+
+// ★ DirectXTexの導入
+#include "externals/DirectXTex/DirectXTex.h"
+#include <wrl.h>
+
+// ★ GetRequiredIntermediateSize / UpdateSubresources はD3D12本体ではなく
+//   d3dx12.h(D3D12 Helper Library)に定義されているため、別途インクルードが必要。
+//   externals/DirectXTex の隣などに d3dx12.h を配置し、パスを合わせること。
+#include "externals/DirectXTex/d3dx12.h"
 
 #include "externals/imgui/imgui.h"
 #include "externals/imgui/imgui_impl_win32.h"
@@ -75,8 +87,172 @@ struct alignas(256) MaterialCBData {
     float color[4];
 };
 
+// ★ DXCを使ってHLSLファイルをコンパイルする
+IDxcBlob* CompileShader(
+    const std::wstring& filePath,
+    const wchar_t* profile,
+    IDxcUtils* dxcUtils,
+    IDxcCompiler3* dxcCompiler,
+    IDxcIncludeHandler* includeHandler) {
+
+    Log(ConvertString(std::format(L"Begin CompileShader, path:{}, profile:{}\n", filePath, profile)));
+
+    IDxcBlobEncoding* shaderSource = nullptr;
+    HRESULT hr = dxcUtils->LoadFile(filePath.c_str(), nullptr, &shaderSource);
+    assert(SUCCEEDED(hr));
+
+    DxcBuffer shaderSourceBuffer{};
+    shaderSourceBuffer.Ptr = shaderSource->GetBufferPointer();
+    shaderSourceBuffer.Size = shaderSource->GetBufferSize();
+    shaderSourceBuffer.Encoding = DXC_CP_UTF8;
+
+    LPCWSTR arguments[] = {
+        filePath.c_str(),
+        L"-E", L"main",
+        L"-T", profile,
+        L"-Zi", L"-Qembed_debug",
+        L"-Od",
+        L"-Zpr",
+    };
+
+    IDxcResult* shaderResult = nullptr;
+    hr = dxcCompiler->Compile(
+        &shaderSourceBuffer,
+        arguments, _countof(arguments),
+        includeHandler,
+        IID_PPV_ARGS(&shaderResult));
+    assert(SUCCEEDED(hr));
+
+    IDxcBlobUtf8* shaderError = nullptr;
+    shaderResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&shaderError), nullptr);
+    if (shaderError != nullptr && shaderError->GetStringLength() != 0) {
+        Log(shaderError->GetStringPointer());
+        assert(false);
+    }
+
+    IDxcBlob* shaderBlob = nullptr;
+    hr = shaderResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shaderBlob), nullptr);
+    assert(SUCCEEDED(hr));
+
+    Log(ConvertString(std::format(L"Compile Succeeded, path:{}, profile:{}\n", filePath, profile)));
+
+    if (shaderError) shaderError->Release();
+    shaderSource->Release();
+    shaderResult->Release();
+    return shaderBlob;
+}
+
+// ★ DirectXTexを使ったテクスチャ読み込み関数
+//    WICファイルを読み込み、ミップマップを生成してScratchImageを返す
+DirectX::ScratchImage LoadTexture(const std::string& filePath) {
+    // テクスチャファイルを読み込んでプログラムで扱えるようにする
+    DirectX::ScratchImage image{};
+    std::wstring filePathW = ConvertString(filePath);
+    HRESULT hr = DirectX::LoadFromWICFile(filePathW.c_str(), DirectX::WIC_FLAGS_FORCE_SRGB, nullptr, image);
+    assert(SUCCEEDED(hr));
+
+    // ミップマップの作成
+    DirectX::ScratchImage mipImages{};
+    hr = DirectX::GenerateMipMaps(
+        image.GetImages(), image.GetImageCount(), image.GetMetadata(),
+        DirectX::TEX_FILTER_SRGB, 0, mipImages);
+    assert(SUCCEEDED(hr));
+
+    // ミップマップ付きのデータを返す
+    return mipImages;
+}
+
+// ★ DirectXTexのMetadataを基にテクスチャリソース(DEFAULTヒープ)を生成する
+ID3D12Resource* CreateTextureResource(ID3D12Device* device, const DirectX::TexMetadata& metadata) {
+    D3D12_RESOURCE_DESC resourceDesc{};
+    resourceDesc.Width = UINT(metadata.width);
+    resourceDesc.Height = UINT(metadata.height);
+    resourceDesc.MipLevels = UINT16(metadata.mipLevels);
+    resourceDesc.DepthOrArraySize = UINT16(metadata.arraySize);
+    resourceDesc.Format = metadata.format;
+    resourceDesc.SampleDesc.Count = 1;
+    resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION(metadata.dimension);
+
+    D3D12_HEAP_PROPERTIES heapProperties{};
+    heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    ID3D12Resource* resource = nullptr;
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&resource));
+    assert(SUCCEEDED(hr));
+    return resource;
+}
+
+// ★ DirectXTexのPrepareUpload + UpdateSubresourcesでテクスチャデータをアップロードする
+//    呼び出し側はintermediateResourceをコマンド実行完了までは解放しないこと
+[[nodiscard]]
+ID3D12Resource* UploadTextureData(
+    ID3D12Resource* texture,
+    const DirectX::ScratchImage& mipImages,
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList) {
+
+    std::vector<D3D12_SUBRESOURCE_DATA> subresources;
+    DirectX::PrepareUpload(device, mipImages.GetImages(), mipImages.GetImageCount(), mipImages.GetMetadata(), subresources);
+    uint64_t intermediateSize = GetRequiredIntermediateSize(texture, 0, UINT(subresources.size()));
+
+    D3D12_HEAP_PROPERTIES uploadHeapProperties{};
+    uploadHeapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC uploadResourceDesc{};
+    uploadResourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadResourceDesc.Width = intermediateSize;
+    uploadResourceDesc.Height = 1;
+    uploadResourceDesc.DepthOrArraySize = 1;
+    uploadResourceDesc.MipLevels = 1;
+    uploadResourceDesc.SampleDesc.Count = 1;
+    uploadResourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* intermediateResource = nullptr;
+    HRESULT hr = device->CreateCommittedResource(
+        &uploadHeapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadResourceDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&intermediateResource));
+    assert(SUCCEEDED(hr));
+
+    UpdateSubresources(commandList, texture, intermediateResource, 0, 0, UINT(subresources.size()), subresources.data());
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    // 呼び出し側はコマンド実行完了まで生存させる必要があるため返却する
+    return intermediateResource;
+}
+
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HRESULT hr = S_OK;
+
+    // ★ DirectXTexはCOMを利用するため初期化する
+    hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+    assert(SUCCEEDED(hr));
+
+    // ★ DXC(シェーダーコンパイラ)の初期化
+    IDxcUtils* dxcUtils = nullptr;
+    IDxcCompiler3* dxcCompiler = nullptr;
+    IDxcIncludeHandler* includeHandler = nullptr;
+    hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtils));
+    assert(SUCCEEDED(hr));
+    hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+    assert(SUCCEEDED(hr));
+    hr = dxcUtils->CreateDefaultIncludeHandler(&includeHandler);
+    assert(SUCCEEDED(hr));
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WindowProc;
@@ -202,67 +378,16 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     assert(fenceEvent != nullptr);
 
-    // ★ 変換行列・テクスチャを使う頂点シェーダー
-    const char* vsCode = R"(
-cbuffer TransformCB : register(b0) {
-    float4x4 worldMatrix;
-};
-struct VSInput {
-    float4 pos : POSITION;
-    float4 color : COLOR;
-    float2 uv : TEXCOORD0;
-};
-struct VSOutput {
-    float4 pos : SV_POSITION;
-    float4 color : COLOR;
-    float2 uv : TEXCOORD0;
-};
-VSOutput main(VSInput input) {
-    VSOutput output;
-    output.pos = mul(input.pos, worldMatrix);
-    output.color = input.color;
-    output.uv = input.uv;
-    return output;
-}
-)";
-
-    // ★ テクスチャ＋マテリアルカラーを乗算するピクセルシェーダー
-    const char* psCode = R"(
-cbuffer MaterialCB : register(b1) {
-    float4 materialColor;
-};
-Texture2D<float4> gTexture : register(t0);
-SamplerState gSampler : register(s0);
-struct PSInput {
-    float4 pos : SV_POSITION;
-    float4 color : COLOR;
-    float2 uv : TEXCOORD0;
-};
-float4 main(PSInput input) : SV_TARGET {
-    float4 texColor = gTexture.Sample(gSampler, input.uv);
-    return texColor * materialColor * input.color;
-}
-)";
-
-    ID3DBlob* vsBlob = nullptr;
-    ID3DBlob* psBlob = nullptr;
-    ID3DBlob* errorBlob = nullptr;
-
-    hr = D3DCompile(vsCode, strlen(vsCode), nullptr, nullptr, nullptr,
-        "main", "vs_5_0", D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, 0, &vsBlob, &errorBlob);
-    if (FAILED(hr)) {
-        if (errorBlob) { OutputDebugStringA((char*)errorBlob->GetBufferPointer()); errorBlob->Release(); }
-        assert(false);
-    }
-    hr = D3DCompile(psCode, strlen(psCode), nullptr, nullptr, nullptr,
-        "main", "ps_5_0", D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, 0, &psBlob, &errorBlob);
-    if (FAILED(hr)) {
-        if (errorBlob) { OutputDebugStringA((char*)errorBlob->GetBufferPointer()); errorBlob->Release(); }
-        assert(false);
-    }
+    // ★ Object3d.VS.hlsl / Object3d.PS.hlsl をDXCでコンパイルする
+    //   (どちらもObject3d.hlsliをincludeしてVertexShaderOutput/PixelShaderOutputを共有している)
+    IDxcBlob* vsBlob = CompileShader(L"Object3d.VS.hlsl", L"vs_6_0", dxcUtils, dxcCompiler, includeHandler);
+    assert(vsBlob != nullptr);
+    IDxcBlob* psBlob = CompileShader(L"Object3d.PS.hlsl", L"ps_6_0", dxcUtils, dxcCompiler, includeHandler);
+    assert(psBlob != nullptr);
 
     // ★ ルートシグネチャ：b0(World行列/VS), b1(マテリアルカラー/PS), t0(テクスチャ/PS) + 静的サンプラー
     ID3D12RootSignature* rootSignature = nullptr;
+    ID3DBlob* errorBlob = nullptr;
 
     D3D12_DESCRIPTOR_RANGE srvRange{};
     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -422,88 +547,14 @@ float4 main(PSInput input) : SV_TARGET {
     scissorRect.right = kClientWidth;
     scissorRect.bottom = kClientHeight;
 
-    // ★ テクスチャ用リソースの作成（手続き的なチェッカー柄、256x256 RGBA8）
-    const UINT kTexWidth = 256;
-    const UINT kTexHeight = 256;
-    const UINT kCellSize = 32;
-    std::vector<uint8_t> textureData(static_cast<size_t>(kTexWidth) * kTexHeight * 4);
-    for (UINT y = 0; y < kTexHeight; ++y) {
-        for (UINT x = 0; x < kTexWidth; ++x) {
-            bool checker = ((x / kCellSize) % 2) ^ ((y / kCellSize) % 2);
-            uint8_t v = checker ? 255 : 180;
-            size_t idx = (static_cast<size_t>(y) * kTexWidth + x) * 4;
-            textureData[idx + 0] = v;
-            textureData[idx + 1] = v;
-            textureData[idx + 2] = v;
-            textureData[idx + 3] = 255;
-        }
-    }
-
-    D3D12_HEAP_PROPERTIES texHeapProps{};
-    texHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC texResDesc{};
-    texResDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texResDesc.Width = kTexWidth;
-    texResDesc.Height = kTexHeight;
-    texResDesc.DepthOrArraySize = 1;
-    texResDesc.MipLevels = 1;
-    texResDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texResDesc.SampleDesc.Count = 1;
-    texResDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-
-    ID3D12Resource* textureResource = nullptr;
-    hr = device->CreateCommittedResource(&texHeapProps, D3D12_HEAP_FLAG_NONE, &texResDesc,
-        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&textureResource));
-    assert(SUCCEEDED(hr));
-
-    UINT64 uploadBufferSize = 0;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT texFootprint{};
-    device->GetCopyableFootprints(&texResDesc, 0, 1, 0, &texFootprint, nullptr, nullptr, &uploadBufferSize);
-
-    ID3D12Resource* textureUploadHeap = nullptr;
-    D3D12_HEAP_PROPERTIES texUploadHeapProps{};
-    texUploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC texUploadResDesc{};
-    texUploadResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    texUploadResDesc.Width = uploadBufferSize;
-    texUploadResDesc.Height = 1;
-    texUploadResDesc.DepthOrArraySize = 1;
-    texUploadResDesc.MipLevels = 1;
-    texUploadResDesc.SampleDesc.Count = 1;
-    texUploadResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    hr = device->CreateCommittedResource(&texUploadHeapProps, D3D12_HEAP_FLAG_NONE, &texUploadResDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&textureUploadHeap));
-    assert(SUCCEEDED(hr));
-
-    uint8_t* mappedUpload = nullptr;
-    textureUploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&mappedUpload));
-    for (UINT y = 0; y < kTexHeight; ++y) {
-        memcpy(mappedUpload + y * texFootprint.Footprint.RowPitch,
-            textureData.data() + static_cast<size_t>(y) * kTexWidth * 4, static_cast<size_t>(kTexWidth) * 4);
-    }
-    textureUploadHeap->Unmap(0, nullptr);
+    // ★ DirectXTexでテクスチャファイルを読み込む（resources/uvChecker.png 等を配置してください）
+    DirectX::ScratchImage mipImages = LoadTexture("resources/uvChecker.png");
+    const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
+    ID3D12Resource* textureResource = CreateTextureResource(device, metadata);
 
     // ★ コマンドリストを開いてテクスチャをアップロードする
     commandList->Reset(commandAllocator, nullptr);
-    {
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = textureResource;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = textureUploadHeap;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint = texFootprint;
-        commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-        D3D12_RESOURCE_BARRIER texBarrier{};
-        texBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        texBarrier.Transition.pResource = textureResource;
-        texBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        texBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        texBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        commandList->ResourceBarrier(1, &texBarrier);
-    }
+    ID3D12Resource* intermediateResource = UploadTextureData(textureResource, mipImages, device, commandList);
     commandList->Close();
     {
         ID3D12CommandList* initCommandLists[] = { commandList };
@@ -515,8 +566,8 @@ float4 main(PSInput input) : SV_TARGET {
         fence->SetEventOnCompletion(fenceValue, fenceEvent);
         WaitForSingleObject(fenceEvent, INFINITE);
     }
-    textureUploadHeap->Release();
-    textureUploadHeap = nullptr;
+    intermediateResource->Release();
+    intermediateResource = nullptr;
 
     // ★ メインループの先頭で開いた状態になるよう、ここでReset
     commandAllocator->Reset();
@@ -536,10 +587,10 @@ float4 main(PSInput input) : SV_TARGET {
     D3D12_GPU_DESCRIPTOR_HANDLE srvHeapGpuStart = srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = texResDesc.Format;
+    srvDesc.Format = metadata.format;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MipLevels = UINT(metadata.mipLevels);
     device->CreateShaderResourceView(textureResource, &srvDesc, srvHeapCpuStart);
     D3D12_GPU_DESCRIPTOR_HANDLE textureGpuHandle = srvHeapGpuStart; // スロット0
 
@@ -693,6 +744,9 @@ float4 main(PSInput input) : SV_TARGET {
     if (device) device->Release();
     if (useAdapter) useAdapter->Release();
     if (dxgiFactory) dxgiFactory->Release();
+    if (includeHandler) includeHandler->Release();
+    if (dxcCompiler) dxcCompiler->Release();
+    if (dxcUtils) dxcUtils->Release();
 
 #ifdef _DEBUG
     if (debugController) debugController->Release();
@@ -704,6 +758,8 @@ float4 main(PSInput input) : SV_TARGET {
         debug->Release();
     }
 #endif
+
+    CoUninitialize();
 
     CloseWindow(hwnd);
     return 0;
