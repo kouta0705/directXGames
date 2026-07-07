@@ -338,6 +338,20 @@ ID3D12Resource* UploadTextureData(
     return intermediateResource;
 }
 
+// ★ SRVヒープの指定indexからCPUディスクリプタハンドルを取得する
+D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandle(ID3D12DescriptorHeap* descriptorHeap, uint32_t descriptorSize, uint32_t index) {
+    D3D12_CPU_DESCRIPTOR_HANDLE handleCPU = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    handleCPU.ptr += (descriptorSize * index);
+    return handleCPU;
+}
+
+// ★ SRVヒープの指定indexからGPUディスクリプタハンドルを取得する
+D3D12_GPU_DESCRIPTOR_HANDLE GetGPUDescriptorHandle(ID3D12DescriptorHeap* descriptorHeap, uint32_t descriptorSize, uint32_t index) {
+    D3D12_GPU_DESCRIPTOR_HANDLE handleGPU = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    handleGPU.ptr += (descriptorSize * index);
+    return handleGPU;
+}
+
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     HRESULT hr = S_OK;
 
@@ -666,14 +680,19 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     scissorRect.right = kClientWidth;
     scissorRect.bottom = kClientHeight;
 
-    // ★ DirectXTexでテクスチャファイルを読み込む（resources/uvChecker.png 等を配置してください）
-    DirectX::ScratchImage mipImages = LoadTexture("resources/uvChecker.png");
-    const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
-    ID3D12Resource* textureResource = CreateTextureResource(device, metadata);
+    // ★ DirectXTexでテクスチャファイルを読み込む（1枚目: uvChecker、2枚目: monsterBall）
+    DirectX::ScratchImage mipImagesUvChecker = LoadTexture("resources/uvChecker.png");
+    const DirectX::TexMetadata& metadataUvChecker = mipImagesUvChecker.GetMetadata();
+    ID3D12Resource* textureResourceUvChecker = CreateTextureResource(device, metadataUvChecker);
 
-    // ★ コマンドリストを開いてテクスチャをアップロードする
+    DirectX::ScratchImage mipImagesMonsterBall = LoadTexture("resources/monsterBall.png");
+    const DirectX::TexMetadata& metadataMonsterBall = mipImagesMonsterBall.GetMetadata();
+    ID3D12Resource* textureResourceMonsterBall = CreateTextureResource(device, metadataMonsterBall);
+
+    // ★ コマンドリストを開いて2枚のテクスチャをまとめてアップロードする
     commandList->Reset(commandAllocator, nullptr);
-    ID3D12Resource* intermediateResource = UploadTextureData(textureResource, mipImages, device, commandList);
+    ID3D12Resource* intermediateResourceUvChecker = UploadTextureData(textureResourceUvChecker, mipImagesUvChecker, device, commandList);
+    ID3D12Resource* intermediateResourceMonsterBall = UploadTextureData(textureResourceMonsterBall, mipImagesMonsterBall, device, commandList);
     commandList->Close();
     {
         ID3D12CommandList* initCommandLists[] = { commandList };
@@ -685,36 +704,54 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
         fence->SetEventOnCompletion(fenceValue, fenceEvent);
         WaitForSingleObject(fenceEvent, INFINITE);
     }
-    intermediateResource->Release();
-    intermediateResource = nullptr;
+    intermediateResourceUvChecker->Release();
+    intermediateResourceUvChecker = nullptr;
+    intermediateResourceMonsterBall->Release();
+    intermediateResourceMonsterBall = nullptr;
 
     // ★ メインループの先頭で開いた状態になるよう、ここでReset
     commandAllocator->Reset();
     commandList->Reset(commandAllocator, nullptr);
 
-    // ★ SRVヒープ：0番=自作テクスチャ、1番=ImGuiフォント
+    // ★ SRVヒープ：0番=ImGuiフォント、1番=uvChecker、2番=monsterBall、3番=空き（予備）
+    const UINT kSrvHeapDescriptorCount = 4;
     ID3D12DescriptorHeap* srvDescriptorHeap = nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.NumDescriptors = 2;
+    srvHeapDesc.NumDescriptors = kSrvHeapDescriptorCount;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&srvDescriptorHeap));
     assert(SUCCEEDED(hr));
 
     UINT srvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE srvHeapCpuStart = srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE srvHeapGpuStart = srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = metadata.format;
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = UINT(metadata.mipLevels);
-    device->CreateShaderResourceView(textureResource, &srvDesc, srvHeapCpuStart);
-    D3D12_GPU_DESCRIPTOR_HANDLE textureGpuHandle = srvHeapGpuStart; // スロット0
+    // スロット0: ImGuiが使う
+    D3D12_CPU_DESCRIPTOR_HANDLE imguiFontCpuHandle = GetCPUDescriptorHandle(srvDescriptorHeap, srvDescriptorSize, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE imguiFontGpuHandle = GetGPUDescriptorHandle(srvDescriptorHeap, srvDescriptorSize, 0);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE imguiFontCpuHandle{ srvHeapCpuStart.ptr + srvDescriptorSize };
-    D3D12_GPU_DESCRIPTOR_HANDLE imguiFontGpuHandle{ srvHeapGpuStart.ptr + srvDescriptorSize };
+    // スロット1: uvChecker
+    D3D12_CPU_DESCRIPTOR_HANDLE uvCheckerCpuHandle = GetCPUDescriptorHandle(srvDescriptorHeap, srvDescriptorSize, 1);
+    D3D12_GPU_DESCRIPTOR_HANDLE uvCheckerGpuHandle = GetGPUDescriptorHandle(srvDescriptorHeap, srvDescriptorSize, 1);
+
+    // スロット2: monsterBall（ball）
+    D3D12_CPU_DESCRIPTOR_HANDLE monsterBallCpuHandle = GetCPUDescriptorHandle(srvDescriptorHeap, srvDescriptorSize, 2);
+    D3D12_GPU_DESCRIPTOR_HANDLE monsterBallGpuHandle = GetGPUDescriptorHandle(srvDescriptorHeap, srvDescriptorSize, 2);
+
+    // スロット3: 空き（今後のために予約、今回は未使用）
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescUvChecker{};
+    srvDescUvChecker.Format = metadataUvChecker.format;
+    srvDescUvChecker.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescUvChecker.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDescUvChecker.Texture2D.MipLevels = UINT(metadataUvChecker.mipLevels);
+    device->CreateShaderResourceView(textureResourceUvChecker, &srvDescUvChecker, uvCheckerCpuHandle);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescMonsterBall{};
+    srvDescMonsterBall.Format = metadataMonsterBall.format;
+    srvDescMonsterBall.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescMonsterBall.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDescMonsterBall.Texture2D.MipLevels = UINT(metadataMonsterBall.mipLevels);
+    device->CreateShaderResourceView(textureResourceMonsterBall, &srvDescMonsterBall, monsterBallCpuHandle);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -733,6 +770,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     // ★ 回転速度をImGuiで調整できるようにする（負の値で左回転）
     float rotationSpeed = -1.0f;
     float rotationAngle = 0.0f;
+    // ★ どちらのテクスチャを使うか（false=uvChecker、true=monsterBall）
+    bool useMonsterBall = false;
 
     bool showDemoWindow = true;
 
@@ -766,6 +805,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             ImGui::ColorEdit4("Material Color", materialColor);
             ImGui::SliderFloat("Rotation Speed", &rotationSpeed, -5.0f, 5.0f);
             ImGui::Text("Angle: %.2f rad", rotationAngle);
+            ImGui::Checkbox("Use MonsterBall", &useMonsterBall);
             ImGui::End();
 
             ImGui::Render();
@@ -805,7 +845,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             // ★ World行列・マテリアルカラー・テクスチャをそれぞれのルートパラメータにセット
             commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
             commandList->SetGraphicsRootConstantBufferView(1, materialBuffer->GetGPUVirtualAddress());
-            commandList->SetGraphicsRootDescriptorTable(2, textureGpuHandle);
+            // ★ チェックボックスの状態に応じてuvChecker / monsterBallを切り替える
+            commandList->SetGraphicsRootDescriptorTable(2, useMonsterBall ? monsterBallGpuHandle : uvCheckerGpuHandle);
             commandList->SetPipelineState(pipelineState);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissorRect);
@@ -846,7 +887,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     materialBuffer->Unmap(0, nullptr);
     if (materialBuffer) materialBuffer->Release();
-    if (textureResource) textureResource->Release();
+    if (textureResourceUvChecker) textureResourceUvChecker->Release();
+    if (textureResourceMonsterBall) textureResourceMonsterBall->Release();
     constantBuffer->Unmap(0, nullptr);
     if (constantBuffer) constantBuffer->Release();
     vertexBuffer->Unmap(0, nullptr);
