@@ -87,6 +87,77 @@ struct alignas(256) MaterialCBData {
     float color[4];
 };
 
+// ★ 頂点データ構造体（POSITION / COLOR / TEXCOORD）
+struct Vertex { float pos[4]; float color[4]; float uv[2]; };
+
+// ★ 球の分割数（緯度・経度とも同じ数で分割）
+const uint32_t kSubdivision = 16;
+
+// ★ UV球のVertexデータを生成する（三角形リスト、インデックスなし）
+std::vector<Vertex> CreateSphereVertexData(uint32_t subdivision) {
+    std::vector<Vertex> vertices;
+    vertices.resize(subdivision * subdivision * 6);
+
+    const float pi = 3.14159265358979f;
+    const float kLatEvery = pi / static_cast<float>(subdivision);       // 緯度1分割分の角度
+    const float kLonEvery = 2.0f * pi / static_cast<float>(subdivision); // 経度1分割分の角度
+
+    for (uint32_t latIndex = 0; latIndex < subdivision; ++latIndex) {
+        float lat = -pi / 2.0f + kLatEvery * latIndex; // -π/2 ～ π/2
+
+        for (uint32_t lonIndex = 0; lonIndex < subdivision; ++lonIndex) {
+            uint32_t start = (latIndex * subdivision + lonIndex) * 6;
+            float lon = lonIndex * kLonEvery; // 0 ～ 2π
+
+            // a: 左下
+            vertices[start].pos[0] = cosf(lat) * cosf(lon);
+            vertices[start].pos[1] = sinf(lat);
+            vertices[start].pos[2] = cosf(lat) * sinf(lon);
+            vertices[start].pos[3] = 1.0f;
+            vertices[start].uv[0] = float(lonIndex) / subdivision;
+            vertices[start].uv[1] = 1.0f - float(latIndex) / subdivision;
+
+            // b: 左上
+            vertices[start + 1].pos[0] = cosf(lat + kLatEvery) * cosf(lon);
+            vertices[start + 1].pos[1] = sinf(lat + kLatEvery);
+            vertices[start + 1].pos[2] = cosf(lat + kLatEvery) * sinf(lon);
+            vertices[start + 1].pos[3] = 1.0f;
+            vertices[start + 1].uv[0] = float(lonIndex) / subdivision;
+            vertices[start + 1].uv[1] = 1.0f - float(latIndex + 1) / subdivision;
+
+            // c: 右下
+            vertices[start + 2].pos[0] = cosf(lat) * cosf(lon + kLonEvery);
+            vertices[start + 2].pos[1] = sinf(lat);
+            vertices[start + 2].pos[2] = cosf(lat) * sinf(lon + kLonEvery);
+            vertices[start + 2].pos[3] = 1.0f;
+            vertices[start + 2].uv[0] = float(lonIndex + 1) / subdivision;
+            vertices[start + 2].uv[1] = 1.0f - float(latIndex) / subdivision;
+
+            // 2枚目の三角形: b, d, c
+            vertices[start + 3] = vertices[start + 1]; // b
+
+            // d: 右上
+            vertices[start + 4].pos[0] = cosf(lat + kLatEvery) * cosf(lon + kLonEvery);
+            vertices[start + 4].pos[1] = sinf(lat + kLatEvery);
+            vertices[start + 4].pos[2] = cosf(lat + kLatEvery) * sinf(lon + kLonEvery);
+            vertices[start + 4].pos[3] = 1.0f;
+            vertices[start + 4].uv[0] = float(lonIndex + 1) / subdivision;
+            vertices[start + 4].uv[1] = 1.0f - float(latIndex + 1) / subdivision;
+
+            vertices[start + 5] = vertices[start + 2]; // c
+
+            // 頂点カラーは白固定（色味はマテリアルカラーで制御）
+            for (uint32_t i = 0; i < 6; ++i) {
+                vertices[start + i].color[0] = 1.0f;
+                vertices[start + i].color[1] = 1.0f;
+                vertices[start + i].color[2] = 1.0f;
+                vertices[start + i].color[3] = 1.0f;
+            }
+        }
+    }
+    return vertices;
+}
+
 // ★ DXCを使ってHLSLファイルをコンパイルする
 IDxcBlob* CompileShader(
     const std::wstring& filePath,
@@ -516,20 +587,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
     assert(SUCCEEDED(hr));
 
-    // ★ 頂点カラーは常に白(1,1,1,1)にしておき、見た目の色味はマテリアルカラーで制御する
-    // ★ 三角形2枚分（6頂点）を定義する。2枚目はZをずらし、DepthStencilによる前後関係を確認できるようにする
-    struct Vertex { float pos[4]; float color[4]; float uv[2]; };
-    Vertex vertices[] = {
-        // 1枚目の三角形（手前 z=0.0）
-        { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
-        { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
-        { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } },
-        // 2枚目の三角形（奥 z=0.5、少しずらして重なりを見やすくする）
-        { {  0.0f,  0.0f, 0.5f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
-        { {  0.7f, -0.8f, 0.5f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
-        { { -0.7f, -0.8f, 0.5f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } },
-    };
-    UINT vertexBufferSize = sizeof(vertices);
+    // ★ 球の頂点データを生成する
+    std::vector<Vertex> vertices = CreateSphereVertexData(kSubdivision);
+    UINT vertexBufferSize = static_cast<UINT>(sizeof(Vertex) * vertices.size());
 
     D3D12_HEAP_PROPERTIES heapProps{};
     heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -549,7 +609,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     Vertex* mappedVertices = nullptr;
     vertexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedVertices));
-    memcpy(mappedVertices, vertices, vertexBufferSize);
+    memcpy(mappedVertices, vertices.data(), vertexBufferSize);
 
     D3D12_VERTEX_BUFFER_VIEW vbView{};
     vbView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
@@ -670,8 +730,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     // ★ マテリアルカラー（デフォルト白）。ImGuiで変更可能
     float materialColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    // ★ 回転速度をImGuiで調整できるようにする
-    float rotationSpeed = 1.0f;
+    // ★ 回転速度をImGuiで調整できるようにする（負の値で左回転）
+    float rotationSpeed = -1.0f;
     float rotationAngle = 0.0f;
 
     bool showDemoWindow = true;
@@ -751,8 +811,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->RSSetScissorRects(1, &scissorRect);
             commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             commandList->IASetVertexBuffers(0, 1, &vbView);
-            // ★ 三角形2枚分、合計6頂点を描画する
-            commandList->DrawInstanced(6, 1, 0, 0);
+            // ★ 球の全頂点を描画する
+            commandList->DrawInstanced(static_cast<UINT>(vertices.size()), 1, 0, 0);
 
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
