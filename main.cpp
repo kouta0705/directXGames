@@ -517,11 +517,17 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     assert(SUCCEEDED(hr));
 
     // ★ 頂点カラーは常に白(1,1,1,1)にしておき、見た目の色味はマテリアルカラーで制御する
+    // ★ 三角形2枚分（6頂点）を定義する。2枚目はZをずらし、DepthStencilによる前後関係を確認できるようにする
     struct Vertex { float pos[4]; float color[4]; float uv[2]; };
     Vertex vertices[] = {
+        // 1枚目の三角形（手前 z=0.0）
         { {  0.0f,  0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
         { {  0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
         { { -0.5f, -0.5f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } },
+        // 2枚目の三角形（奥 z=0.5、少しずらして重なりを見やすくする）
+        { {  0.0f,  0.0f, 0.5f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.0f } },
+        { {  0.7f, -0.8f, 0.5f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f } },
+        { { -0.7f, -0.8f, 0.5f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.0f, 1.0f } },
     };
     UINT vertexBufferSize = sizeof(vertices);
 
@@ -745,7 +751,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->RSSetScissorRects(1, &scissorRect);
             commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             commandList->IASetVertexBuffers(0, 1, &vbView);
-            commandList->DrawInstanced(3, 1, 0, 0);
+            // ★ 三角形2枚分、合計6頂点を描画する
+            commandList->DrawInstanced(6, 1, 0, 0);
 
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
