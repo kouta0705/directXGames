@@ -41,6 +41,7 @@ struct Material {
     Vector4 color;
     int32_t enableLighting;
     float padding[3];
+    Matrix4x4 uvTransform;
 };
 
 struct DirectionalLight {
@@ -644,6 +645,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     materialResource->Map(0, nullptr, reinterpret_cast<void**>(&materialData));
     materialData->color = { 1.0f, 1.0f, 1.0f, 1.0f }; // 白
     materialData->enableLighting = true;
+    materialData->uvTransform = MakeIdentity4x4();
 
     // Sprite用マテリアル（ライティングは適用しない）
     ID3D12Resource* materialResourceSprite = CreateBufferResource(device, sizeof(Material));
@@ -651,6 +653,10 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     materialResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&materialDataSprite));
     materialDataSprite->color = { 1.0f, 1.0f, 1.0f, 1.0f };
     materialDataSprite->enableLighting = false;
+    materialDataSprite->uvTransform = MakeIdentity4x4();
+
+    // Sprite用UVTransform（CPU側のスケール・回転・平行移動）
+    Transform uvTransformSprite{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
 
     ID3D12Resource* wvpResource = CreateBufferResource(device, sizeof(TransformationMatrix));
     TransformationMatrix* transformationMatrixData = nullptr;
@@ -842,6 +848,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             transformationMatrixDataSprite->WVP = worldViewProjectionMatrixSprite;
             transformationMatrixDataSprite->World = worldMatrixSprite;
 
+            // UVTransform行列を作ってSprite用マテリアルに反映
+            Matrix4x4 uvTransformMatrix = MakeAffineMatrix(
+                uvTransformSprite.scale, uvTransformSprite.rotate, uvTransformSprite.translate);
+            materialDataSprite->uvTransform = uvTransformMatrix;
+
 #ifdef USE_IMGUI
             ImGui::Begin("Settings");
             ImGui::ColorEdit4("MaterialColor", &materialData->color.x);
@@ -854,6 +865,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             ImGui::ColorEdit3("LightColor", &directionalLightData->color.x);
             ImGui::DragFloat3("LightDirection", &directionalLightData->direction.x, 0.01f, -1.0f, 1.0f);
             ImGui::DragFloat("LightIntensity", &directionalLightData->intensity, 0.01f, 0.0f, 10.0f);
+            ImGui::DragFloat2("UVTranslate", &uvTransformSprite.translate.x, 0.01f);
+            ImGui::DragFloat2("UVScale", &uvTransformSprite.scale.x, 0.01f);
+            ImGui::SliderAngle("UVRotate", &uvTransformSprite.rotate.z);
             ImGui::End();
 #endif
 
