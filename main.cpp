@@ -669,37 +669,47 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     Transform transform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
     Transform cameraTransform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -10.0f} };
 
-    // Sprite用頂点リソース
-    ID3D12Resource* vertexResourceSprite = CreateBufferResource(device, sizeof(VertexData) * 6);
+    // Sprite用頂点リソース（重複を無くし、頂点4つだけにする）
+    ID3D12Resource* vertexResourceSprite = CreateBufferResource(device, sizeof(VertexData) * 4);
 
     D3D12_VERTEX_BUFFER_VIEW vertexBufferViewSprite{};
     vertexBufferViewSprite.BufferLocation = vertexResourceSprite->GetGPUVirtualAddress();
-    vertexBufferViewSprite.SizeInBytes = sizeof(VertexData) * 6;
+    vertexBufferViewSprite.SizeInBytes = sizeof(VertexData) * 4;
     vertexBufferViewSprite.StrideInBytes = sizeof(VertexData);
 
     VertexData* vertexDataSprite = nullptr;
     vertexResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&vertexDataSprite));
-    // 1枚目の三角形
-    vertexDataSprite[0].position = { 0.0f, 360.0f, 0.0f, 1.0f }; // 左下
+    // 頂点0：左下
+    vertexDataSprite[0].position = { 0.0f, 360.0f, 0.0f, 1.0f };
     vertexDataSprite[0].texCoord = { 0.0f, 1.0f };
     vertexDataSprite[0].normal = { 0.0f, 0.0f, -1.0f };
-    vertexDataSprite[1].position = { 0.0f, 0.0f, 0.0f, 1.0f };   // 左上
+    // 頂点1：左上
+    vertexDataSprite[1].position = { 0.0f, 0.0f, 0.0f, 1.0f };
     vertexDataSprite[1].texCoord = { 0.0f, 0.0f };
     vertexDataSprite[1].normal = { 0.0f, 0.0f, -1.0f };
-    vertexDataSprite[2].position = { 640.0f, 360.0f, 0.0f, 1.0f }; // 右下
+    // 頂点2：右下
+    vertexDataSprite[2].position = { 640.0f, 360.0f, 0.0f, 1.0f };
     vertexDataSprite[2].texCoord = { 1.0f, 1.0f };
     vertexDataSprite[2].normal = { 0.0f, 0.0f, -1.0f };
-    // 2枚目の三角形
-    vertexDataSprite[3].position = { 0.0f, 0.0f, 0.0f, 1.0f };    // 左上
-    vertexDataSprite[3].texCoord = { 0.0f, 0.0f };
+    // 頂点3：右上
+    vertexDataSprite[3].position = { 640.0f, 0.0f, 0.0f, 1.0f };
+    vertexDataSprite[3].texCoord = { 1.0f, 0.0f };
     vertexDataSprite[3].normal = { 0.0f, 0.0f, -1.0f };
-    vertexDataSprite[4].position = { 640.0f, 0.0f, 0.0f, 1.0f };  // 右上
-    vertexDataSprite[4].texCoord = { 1.0f, 0.0f };
-    vertexDataSprite[4].normal = { 0.0f, 0.0f, -1.0f };
-    vertexDataSprite[5].position = { 640.0f, 360.0f, 0.0f, 1.0f }; // 右下
-    vertexDataSprite[5].texCoord = { 1.0f, 1.0f };
-    vertexDataSprite[5].normal = { 0.0f, 0.0f, -1.0f };
     vertexResourceSprite->Unmap(0, nullptr);
+
+    // Sprite用インデックスリソース（三角形「0,1,2」と「1,3,2」を頂点インデックスで表現）
+    ID3D12Resource* indexResourceSprite = CreateBufferResource(device, sizeof(uint32_t) * 6);
+
+    D3D12_INDEX_BUFFER_VIEW indexBufferViewSprite{};
+    indexBufferViewSprite.BufferLocation = indexResourceSprite->GetGPUVirtualAddress();
+    indexBufferViewSprite.SizeInBytes = sizeof(uint32_t) * 6;
+    indexBufferViewSprite.Format = DXGI_FORMAT_R32_UINT;
+
+    uint32_t* indexDataSprite = nullptr;
+    indexResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&indexDataSprite));
+    indexDataSprite[0] = 0; indexDataSprite[1] = 1; indexDataSprite[2] = 2; // 1枚目の三角形
+    indexDataSprite[3] = 1; indexDataSprite[4] = 3; indexDataSprite[5] = 2; // 2枚目の三角形
+    indexResourceSprite->Unmap(0, nullptr);
 
     // Sprite用TransformationMatrixリソース（VSのcbufferと同じ構造にする）
     ID3D12Resource* transformationMatrixResourceSprite = CreateBufferResource(device, sizeof(TransformationMatrix));
@@ -891,8 +901,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->SetGraphicsRootConstantBufferView(0, materialResourceSprite->GetGPUVirtualAddress());
             commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
             commandList->IASetVertexBuffers(0, 1, &vertexBufferViewSprite);
+            commandList->IASetIndexBuffer(&indexBufferViewSprite);
             commandList->SetGraphicsRootConstantBufferView(1, transformationMatrixResourceSprite->GetGPUVirtualAddress());
-            commandList->DrawInstanced(6, 1, 0, 0);
+            commandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
 #ifdef USE_IMGUI
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
@@ -938,6 +949,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     vertexResource->Release();
     transformationMatrixResourceSprite->Release();
     vertexResourceSprite->Release();
+    indexResourceSprite->Release();
     graphicsPipelineState->Release();
     signatureBlob->Release();
     if (errorBlob) errorBlob->Release();
