@@ -505,8 +505,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     rasterizerDesc.CullMode = D3D12_CULL_MODE_BACK;
     rasterizerDesc.FillMode = D3D12_FILL_MODE_SOLID;
 
-    IDxcBlob* vertexShaderBlob = CompileShader(L"Object3d.VS.hlsl", L"vs_6_0", dxcUtils, dxcCompiler, includeHandler);
-    IDxcBlob* pixelShaderBlob = CompileShader(L"Object3d.PS.hlsl", L"ps_6_0", dxcUtils, dxcCompiler, includeHandler);
+    // ★修正: Half Lambertの実装が含まれる正しいシェーダーファイル名を指定
+    IDxcBlob* vertexShaderBlob = CompileShader(L"Object3d_VS.hlsl", L"vs_6_0", dxcUtils, dxcCompiler, includeHandler);
+    IDxcBlob* pixelShaderBlob = CompileShader(L"Object3d_PS.hlsl", L"ps_6_0", dxcUtils, dxcCompiler, includeHandler);
 
     // DepthStencilState
     D3D12_DEPTH_STENCIL_DESC depthStencilDesc{};
