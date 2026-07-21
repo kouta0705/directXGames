@@ -15,6 +15,9 @@
 #include "externals/DirectXTex/d3dx12.h"
 #include <vector>
 #include <wrl.h>
+#include <fstream>
+#include <sstream>
+#include <cstring>
 #include "Vector3.h"
 #include "Matrix4x4.h"
 #include "Transform.h"
@@ -54,6 +57,118 @@ struct TransformationMatrix {
     Matrix4x4 WVP;
     Matrix4x4 World;
 };
+
+// texcoord読み取り用の一時構造体
+struct TexcoordTemp { float x, y; };
+
+// objが参照するmtlの情報
+struct MaterialData {
+    std::string textureFilePath;
+};
+
+// objファイル全体の情報
+struct ModelData {
+    std::vector<VertexData> vertices;
+    MaterialData material;
+};
+
+// mtlファイルを読む
+MaterialData LoadMaterialTemplateFile(const std::string& directoryPath, const std::string& filename) {
+    MaterialData materialData;                   // 構築するMaterialData
+    std::string line;                             // ファイルから読んだ1行を格納するもの
+
+    std::ifstream file(directoryPath + "/" + filename); // ファイルを開く
+    assert(file.is_open());                        // とりあえず開けなかったら止める
+
+    while (std::getline(file, line)) {
+        std::string identifier;
+        std::istringstream s(line);
+        s >> identifier;
+
+        // identifierに応じた処理
+        if (identifier == "map_Kd") {
+            std::string textureFilename;
+            s >> textureFilename;
+            // 連結してファイルパスにする
+            materialData.textureFilePath = directoryPath + "/" + textureFilename;
+        }
+    }
+    return materialData;
+}
+
+// objファイルを読む
+ModelData LoadObjFile(const std::string& directoryPath, const std::string& filename) {
+    ModelData modelData;                          // 構築するModelData
+    std::vector<Vector4> positions;                // 位置
+    std::vector<Vector3> normals;                  // 法線
+    std::vector<TexcoordTemp> texcoords;           // テクスチャ座標
+    std::string line;                              // ファイルから読んだ1行を格納するもの
+
+    std::ifstream file(directoryPath + "/" + filename); // ファイルを開く
+    assert(file.is_open());                        // とりあえず開けなかったら止める
+
+    while (std::getline(file, line)) {
+        std::string identifier;
+        std::istringstream s(line);
+        s >> identifier; // 先頭の識別子を読む
+
+        // identifierに応じた処理
+        if (identifier == "v") {
+            Vector4 position;
+            s >> position.x >> position.y >> position.z;
+            position.x *= -1.0f; // 右手系->左手系変換のためxを反転
+            position.w = 1.0f;
+            positions.push_back(position);
+        }
+        else if (identifier == "vt") {
+            TexcoordTemp texcoord;
+            s >> texcoord.x >> texcoord.y;
+            texcoord.y = 1.0f - texcoord.y; // Blenderは左下原点系のため、上下反転して左上原点系に合わせる
+            texcoords.push_back(texcoord);
+        }
+        else if (identifier == "vn") {
+            Vector3 normal;
+            s >> normal.x >> normal.y >> normal.z;
+            normal.x *= -1.0f; // 右手系->左手系変換のためxを反転
+            normals.push_back(normal);
+        }
+        else if (identifier == "f") {
+            VertexData triangle[3];
+            // 面は三角形限定。その他の場合は未対応
+            for (int32_t faceVertex = 0; faceVertex < 3; ++faceVertex) {
+                std::string vertexDefinition;
+                s >> vertexDefinition;
+                // 頂点の要素へのindexは「位置/UV/法線」で格納されているので、分解してindexを取得する
+                std::istringstream v(vertexDefinition);
+                uint32_t elementIndices[3];
+                for (int32_t element = 0; element < 3; ++element) {
+                    std::string index;
+                    std::getline(v, index, '/'); // /区切りでインデックスを読んでいく
+                    elementIndices[element] = std::stoi(index);
+                }
+                // 要素へのindexから、実際の要素の値を取得して、頂点を構築する
+                Vector4 position = positions[elementIndices[0] - 1];
+                TexcoordTemp texcoord = texcoords[elementIndices[1] - 1];
+                Vector3 normal = normals[elementIndices[2] - 1];
+                triangle[faceVertex].position = position;
+                triangle[faceVertex].texCoord = { texcoord.x, texcoord.y };
+                triangle[faceVertex].normal = normal;
+            }
+            // 右手系->左手系変換のため、頂点の順番を逆にして面の向き（表裏）を合わせる
+            modelData.vertices.push_back(triangle[2]);
+            modelData.vertices.push_back(triangle[1]);
+            modelData.vertices.push_back(triangle[0]);
+        }
+        else if (identifier == "mtllib") {
+            // materialTemplateLibraryファイルの名前を取得する
+            std::string materialFilename;
+            s >> materialFilename;
+            // 基本的にobjファイルと同一階層にmtlは存在させるので、ディレクトリ名とファイル名を渡す
+            modelData.material = LoadMaterialTemplateFile(directoryPath, materialFilename);
+        }
+    }
+    return modelData;
+}
 
 std::wstring ConvertString(const std::string& str) {
     if (str.empty()) return {};
@@ -534,11 +649,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     hr = device->CreateGraphicsPipelineState(&graphicsPipelineStateDesc, IID_PPV_ARGS(&graphicsPipelineState));
     assert(SUCCEEDED(hr));
 
-    // 球の分割数
-    const uint32_t kSubdivision = 16;
-    const uint32_t kSphereVertexCount = kSubdivision * kSubdivision * 6;
+    // objファイルの読み込み（resources/以下に配置したモデルを読む）
+    ModelData modelData = LoadObjFile("resources", "plane.obj");
+    const uint32_t kSphereVertexCount = static_cast<uint32_t>(modelData.vertices.size());
 
-    // 頂点バッファ
+    // 頂点バッファ（objから読み込んだ頂点数ぶん確保する）
     ID3D12Resource* vertexResource = CreateBufferResource(device, sizeof(VertexData) * kSphereVertexCount);
 
     D3D12_VERTEX_BUFFER_VIEW vertexBufferView{};
@@ -548,97 +663,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     VertexData* vertexData = nullptr;
     vertexResource->Map(0, nullptr, reinterpret_cast<void**>(&vertexData));
-
-    // 球の頂点データを生成
-    {
-        const float pi = 3.14159265358979323846f;
-        // 経度1分割の角度
-        const float kLonEvery = pi * 2.0f / float(kSubdivision);
-        // 緯度1分割の角度
-        const float kLatEvery = pi / float(kSubdivision);
-
-        // 緯度ループ
-        for (uint32_t latIndex = 0; latIndex < kSubdivision; ++latIndex) {
-            float lat = -pi / 2.0f + kLatEvery * float(latIndex); // θ
-
-            // 経度ループ
-            for (uint32_t lonIndex = 0; lonIndex < kSubdivision; ++lonIndex) {
-                float lon = lonIndex * kLonEvery; // φ
-
-                uint32_t start = (latIndex * kSubdivision + lonIndex) * 6;
-
-                float u = float(lonIndex) / float(kSubdivision);
-                float v = 1.0f - float(latIndex) / float(kSubdivision);
-                float uNext = float(lonIndex + 1) / float(kSubdivision);
-                float vNext = 1.0f - float(latIndex + 1) / float(kSubdivision);
-
-                // 頂点a
-                vertexData[start + 0].position = {
-                    std::cosf(lat) * std::cosf(lon),
-                    std::sinf(lat),
-                    std::cosf(lat) * std::sinf(lon),
-                    1.0f
-                };
-                vertexData[start + 0].texCoord = { u, v };
-                vertexData[start + 0].normal = {
-                    vertexData[start + 0].position.x,
-                    vertexData[start + 0].position.y,
-                    vertexData[start + 0].position.z
-                };
-
-                // 頂点b
-                vertexData[start + 1].position = {
-                    std::cosf(lat + kLatEvery) * std::cosf(lon),
-                    std::sinf(lat + kLatEvery),
-                    std::cosf(lat + kLatEvery) * std::sinf(lon),
-                    1.0f
-                };
-                vertexData[start + 1].texCoord = { u, vNext };
-                vertexData[start + 1].normal = {
-                    vertexData[start + 1].position.x,
-                    vertexData[start + 1].position.y,
-                    vertexData[start + 1].position.z
-                };
-
-                // 頂点c
-                vertexData[start + 2].position = {
-                    std::cosf(lat) * std::cosf(lon + kLonEvery),
-                    std::sinf(lat),
-                    std::cosf(lat) * std::sinf(lon + kLonEvery),
-                    1.0f
-                };
-                vertexData[start + 2].texCoord = { uNext, v };
-                vertexData[start + 2].normal = {
-                    vertexData[start + 2].position.x,
-                    vertexData[start + 2].position.y,
-                    vertexData[start + 2].position.z
-                };
-
-                // 三角形2枚目
-                vertexData[start + 3].position = vertexData[start + 2].position;
-                vertexData[start + 3].texCoord = vertexData[start + 2].texCoord;
-                vertexData[start + 3].normal = vertexData[start + 2].normal;
-
-                vertexData[start + 4].position = vertexData[start + 1].position;
-                vertexData[start + 4].texCoord = vertexData[start + 1].texCoord;
-                vertexData[start + 4].normal = vertexData[start + 1].normal;
-
-                // 頂点d
-                vertexData[start + 5].position = {
-                    std::cosf(lat + kLatEvery) * std::cosf(lon + kLonEvery),
-                    std::sinf(lat + kLatEvery),
-                    std::cosf(lat + kLatEvery) * std::sinf(lon + kLonEvery),
-                    1.0f
-                };
-                vertexData[start + 5].texCoord = { uNext, vNext };
-                vertexData[start + 5].normal = {
-                    vertexData[start + 5].position.x,
-                    vertexData[start + 5].position.y,
-                    vertexData[start + 5].position.z
-                };
-            }
-        }
-    }
+    // objファイルから読み込んだ頂点データをそのままVRAM用バッファへコピーする
+    std::memcpy(vertexData, modelData.vertices.data(), sizeof(VertexData) * kSphereVertexCount);
     vertexResource->Unmap(0, nullptr);
 
     ID3D12Resource* materialResource = CreateBufferResource(device, sizeof(Material));
@@ -747,8 +773,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     io.Fonts->Build();
 #endif
 
-    // uvChecker読み込み
-    DirectX::ScratchImage mipImages = LoadTexture("resources/uvChecker.png");
+    // objが参照しているテクスチャがあればそれを、無ければuvCheckerを読み込む
+    std::string modelTexturePath = modelData.material.textureFilePath.empty()
+        ? "resources/uvChecker.png"
+        : modelData.material.textureFilePath;
+    DirectX::ScratchImage mipImages = LoadTexture(modelTexturePath);
     const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
     ID3D12Resource* textureResource = CreateTextureResource(device, metadata);
     ID3D12Resource* intermediateResource = UploadTextureData(textureResource, mipImages, device, commandList);
