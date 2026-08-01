@@ -18,6 +18,7 @@
 #include "Vector3.h"
 #include "Matrix4x4.h"
 #include "Transform.h"
+#include "DebugCamera.h"
 // OBJファイル読み込みに必要
 #include <fstream>
 #include <sstream>
@@ -868,6 +869,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     Transform transform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
     Transform cameraTransform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -10.0f} };
 
+    // デバッグカメラ（初期状態はデバッグカメラ、SPACEで切り替え）
+    DebugCamera debugCamera;
+    debugCamera.Initialize();
+    bool isDebugCamera = true;
+
     // Sprite
     Microsoft::WRL::ComPtr<ID3D12Resource> vertexResourceSprite = CreateBufferResource(device, sizeof(VertexData) * 4);
 
@@ -1084,18 +1090,40 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
                 OutputDebugStringA("Hit DOWN\n");
             }
 
+            // SPACEキーが押された瞬間にデバッグカメラ／通常カメラを切り替え
+            if (IsKeyTriggered(DIK_SPACE)) {
+                isDebugCamera = !isDebugCamera;
+            }
+
+            // デバッグカメラ更新（デバッグカメラモードのときのみ）
+            if (isDebugCamera) {
+                debugCamera.Update(hwnd);
+            }
+
 #ifdef USE_IMGUI
             ImGui_ImplDX12_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
 #endif
 
-            transform.rotate.y += 0.03f;
+            // 通常カメラモードのときだけ自動回転
+            if (!isDebugCamera) {
+                transform.rotate.y += 0.03f;
+            }
 
             // モデル用 行列計算
             Matrix4x4 worldMatrix = MakeAffineMatrix(transform.scale, transform.rotate, transform.translate);
-            Matrix4x4 cameraMatrix = MakeAffineMatrix(cameraTransform.scale, cameraTransform.rotate, cameraTransform.translate);
-            Matrix4x4 viewMatrix = Inverse(cameraMatrix);
+
+            Matrix4x4 viewMatrix;
+            if (isDebugCamera) {
+                // デバッグカメラのビュー行列を使う
+                viewMatrix = debugCamera.GetViewMatrix();
+            } else {
+                // 通常カメラのビュー行列
+                Matrix4x4 cameraMatrix = MakeAffineMatrix(cameraTransform.scale, cameraTransform.rotate, cameraTransform.translate);
+                viewMatrix = Inverse(cameraMatrix);
+            }
+
             Matrix4x4 projectionMatrix = MakePerspectiveFovMatrix(
                 0.45f,
                 float(kClientWidth) / float(kClientHeight),
@@ -1115,30 +1143,33 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             transformationMatrixDataSprite->World = worldMatrixSprite;
 
 #ifdef USE_IMGUI
-            ImGui::Begin("Settings");
-            ImGui::DragFloat3("CameraTranslate", &cameraTransform.translate.x, 0.01f);
-            ImGui::DragFloat("CameraRotateX", &cameraTransform.rotate.x, 0.01f);
-            ImGui::DragFloat("CameraRotateY", &cameraTransform.rotate.y, 0.01f);
-            ImGui::DragFloat("CameraRotateZ", &cameraTransform.rotate.z, 0.01f);
-            ImGui::ColorEdit4("color", &materialData2->color.x);
-            ImGui::Checkbox("enableLighting", reinterpret_cast<bool*>(&materialData2->enableLighting));
-            ImGui::ColorEdit4("colorSprite", &materialDataSprite->color.x);
-            ImGui::DragFloat3("translateSprite", &transformSprite.translate.x, 1.0f);
-            ImGui::Checkbox("useMonsterBall", &useMonsterBall);
-            ImGui::ColorEdit4("LightColor", &directionalLightData->color.x);
-            ImGui::DragFloat3("LightDirection", &directionalLightData->direction.x, 0.01f);
-            ImGui::DragFloat("Intensity", &directionalLightData->intensity, 0.01f);
-            // UVTransform編集 (UV座標系はxy平面なので回転軸はz)
-            ImGui::DragFloat2("UVTranslate", &uvTransformSprite.translate.x, 0.01f, -10.0f, 10.0f);
-            ImGui::DragFloat2("UVScale",     &uvTransformSprite.scale.x,     0.01f, -10.0f, 10.0f);
-            ImGui::SliderAngle("UVRotate",   &uvTransformSprite.rotate.z);
-            ImGui::End();
+            // 通常カメラモードのときだけImGuiを表示
+            if (!isDebugCamera) {
+                ImGui::Begin("Settings");
+                ImGui::DragFloat3("CameraTranslate", &cameraTransform.translate.x, 0.01f);
+                ImGui::DragFloat("CameraRotateX", &cameraTransform.rotate.x, 0.01f);
+                ImGui::DragFloat("CameraRotateY", &cameraTransform.rotate.y, 0.01f);
+                ImGui::DragFloat("CameraRotateZ", &cameraTransform.rotate.z, 0.01f);
+                ImGui::ColorEdit4("color", &materialData2->color.x);
+                ImGui::Checkbox("enableLighting", reinterpret_cast<bool*>(&materialData2->enableLighting));
+                ImGui::ColorEdit4("colorSprite", &materialDataSprite->color.x);
+                ImGui::DragFloat3("translateSprite", &transformSprite.translate.x, 1.0f);
+                ImGui::Checkbox("useMonsterBall", &useMonsterBall);
+                ImGui::ColorEdit4("LightColor", &directionalLightData->color.x);
+                ImGui::DragFloat3("LightDirection", &directionalLightData->direction.x, 0.01f);
+                ImGui::DragFloat("Intensity", &directionalLightData->intensity, 0.01f);
+                // UVTransform編集 (UV座標系はxy平面なので回転軸はz)
+                ImGui::DragFloat2("UVTranslate", &uvTransformSprite.translate.x, 0.01f, -10.0f, 10.0f);
+                ImGui::DragFloat2("UVScale",     &uvTransformSprite.scale.x,     0.01f, -10.0f, 10.0f);
+                ImGui::SliderAngle("UVRotate",   &uvTransformSprite.rotate.z);
+                ImGui::End();
 
-            // UVTransform行列を生成してSpriteのMaterialにセット (SRTの順)
-            Matrix4x4 uvTransformMatrix = MakeScaleMatrix(uvTransformSprite.scale);
-            uvTransformMatrix = Multiply(uvTransformMatrix, MakeRotateZMatrix(uvTransformSprite.rotate.z));
-            uvTransformMatrix = Multiply(uvTransformMatrix, MakeTranslateMatrix(uvTransformSprite.translate));
-            materialDataSprite->uvTransform = uvTransformMatrix;
+                // UVTransform行列を生成してSpriteのMaterialにセット (SRTの順)
+                Matrix4x4 uvTransformMatrix = MakeScaleMatrix(uvTransformSprite.scale);
+                uvTransformMatrix = Multiply(uvTransformMatrix, MakeRotateZMatrix(uvTransformSprite.rotate.z));
+                uvTransformMatrix = Multiply(uvTransformMatrix, MakeTranslateMatrix(uvTransformSprite.translate));
+                materialDataSprite->uvTransform = uvTransformMatrix;
+            }
 #endif
 
 #ifdef USE_IMGUI
