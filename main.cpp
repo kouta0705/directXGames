@@ -85,6 +85,37 @@ struct DirectionalLight {
 };
 
 // ======================================================
+// 動的に生成・削除するオブジェクト管理
+// ======================================================
+
+// オブジェクトの種類(SpriteかModelか)
+enum class ObjectType {
+    Sprite,
+    Model,
+};
+
+// ImGuiの「Create」ボタンから生成され、「Delete」ボタンで削除できるオブジェクト。
+// 頂点/インデックスバッファはSprite用・Model用それぞれ1つずつ使い回し、
+// インスタンス固有の情報(Material・TransformationMatrix・SRT)だけを個別に持つ。
+struct GameObject {
+    ObjectType type = ObjectType::Sprite;
+
+    Transform transform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
+    // SpriteのみUVTransformとして使用
+    Transform uvTransform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
+    // ModelのみuvChecker/モンスターボールテクスチャの切り替えに使用
+    bool useMonsterBall = true;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> materialResource;
+    Material* materialData = nullptr;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> transformResource;
+    TransformationMatrix* transformData = nullptr;
+
+    bool IsSprite() const { return type == ObjectType::Sprite; }
+};
+
+// ======================================================
 // リソースリークチェッカー
 // mainの先頭でインスタンスを作ることで、
 // すべてのComPtrが解放された後にデストラクタが呼ばれる
@@ -145,6 +176,30 @@ Microsoft::WRL::ComPtr<ID3D12Resource> CreateBufferResource(const Microsoft::WRL
     );
     assert(SUCCEEDED(hr));
     return resource;
+}
+
+// 新しいGameObjectを1つ生成する(ImGuiの「Create」ボタンから呼ばれる)
+// 頂点・インデックスバッファは共有ジオメトリを使い回すので、ここではMaterialと
+// TransformationMatrixの定数バッファだけを新規に確保してマップする。
+GameObject CreateGameObject(const Microsoft::WRL::ComPtr<ID3D12Device>& device, ObjectType type)
+{
+    GameObject obj{};
+    obj.type = type;
+
+    // Material用リソース
+    obj.materialResource = CreateBufferResource(device, sizeof(Material));
+    obj.materialResource->Map(0, nullptr, reinterpret_cast<void**>(&obj.materialData));
+    obj.materialData->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+    obj.materialData->enableLighting = (type == ObjectType::Model) ? 1 : 0;
+    obj.materialData->uvTransform = MakeIdentity4x4();
+
+    // TransformationMatrix用リソース
+    obj.transformResource = CreateBufferResource(device, sizeof(TransformationMatrix));
+    obj.transformResource->Map(0, nullptr, reinterpret_cast<void**>(&obj.transformData));
+    obj.transformData->WVP = MakeIdentity4x4();
+    obj.transformData->World = MakeIdentity4x4();
+
+    return obj;
 }
 
 Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> CreateDescriptorHeap(
@@ -373,7 +428,8 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
             position.x *= -1.0f;
             positions.push_back(position);
 
-        } else if (identifier == "vt") {
+        }
+        else if (identifier == "vt") {
             // テクスチャ座標
             Vector2 texcoord;
             s >> texcoord.x >> texcoord.y;
@@ -381,7 +437,8 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
             texcoord.y = 1.0f - texcoord.y;
             texcoords.push_back(texcoord);
 
-        } else if (identifier == "vn") {
+        }
+        else if (identifier == "vn") {
             // 法線
             Vector3 normal;
             s >> normal.x >> normal.y >> normal.z;
@@ -389,38 +446,49 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
             normal.x *= -1.0f;
             normals.push_back(normal);
 
-        } else if (identifier == "f") {
-            // 面(三角形限定)
-            VertexData triangle[3];
-
-            for (int32_t faceVertex = 0; faceVertex < 3; ++faceVertex) {
-                std::string vertexDefinition;
-                s >> vertexDefinition;
-
+        }
+        else if (identifier == "f") {
+            // 面(三角形・四角形どちらにも対応)
+            // 行に残っている頂点定義(位置/UV/法線)を全て読み取る。
+            // 三角形なら3個、四角形なら4個のトークンになる。
+            std::vector<VertexData> faceVertices;
+            std::string vertexDefinition;
+            while (s >> vertexDefinition) {
                 // 頂点の要素へのIndexは「位置/UV/法線」で格納されているので、分解してIndexを取得する
                 std::istringstream v(vertexDefinition);
-                uint32_t elementIndices[3];
+                uint32_t elementIndices[3] = {};
                 for (int32_t element = 0; element < 3; ++element) {
                     std::string index;
                     std::getline(v, index, '/'); // /区切りでインデックスを読んでいく
-                    elementIndices[element] = std::stoi(index);
+                    if (index.empty()) {
+                        // UVやNormalが無いOBJ(v/vt/vnのいずれかが欠けている)への保険
+                        elementIndices[element] = 1;
+                        continue;
+                    }
+                    elementIndices[element] = static_cast<uint32_t>(std::stoi(index));
                 }
 
                 // 要素へのIndexから、実際の要素の値を取得して、頂点を構築する
                 // インデックスは1始まりなので-1する
-                Vector4 position  = positions[elementIndices[0] - 1];
-                Vector2 texcoord  = texcoords[elementIndices[1] - 1];
-                Vector3 normal    = normals[elementIndices[2] - 1];
+                Vector4 position = positions[elementIndices[0] - 1];
+                Vector2 texcoord = texcoords.empty() ? Vector2{ 0.0f, 0.0f } : texcoords[elementIndices[1] - 1];
+                Vector3 normal = normals.empty() ? Vector3{ 0.0f, 1.0f, 0.0f } : normals[elementIndices[2] - 1];
 
-                triangle[faceVertex] = { position, texcoord, normal };
+                faceVertices.push_back({ position, texcoord, normal });
             }
 
-            // 右手系→左手系: 頂点を逆順で登録することで、回り順を逆にする
-            modelData.vertices.push_back(triangle[2]);
-            modelData.vertices.push_back(triangle[1]);
-            modelData.vertices.push_back(triangle[0]);
+            // ファン三角形分割: 3頂点なら1枚、4頂点(quad)なら2枚の三角形にする
+            // (0,1,2) (0,2,3) ... の形で扇状に分割する一般的な手法
+            for (size_t i = 1; i + 1 < faceVertices.size(); ++i) {
+                VertexData triangle[3] = { faceVertices[0], faceVertices[i], faceVertices[i + 1] };
 
-        } else if (identifier == "mtllib") {
+                // 右手系→左手系: 頂点を逆順で登録することで、回り順を逆にする
+                modelData.vertices.push_back(triangle[2]);
+                modelData.vertices.push_back(triangle[1]);
+                modelData.vertices.push_back(triangle[0]);
+            }
+        }
+        else if (identifier == "mtllib") {
             // materialTemplateLibraryファイルの名前を取得する
             std::string materialFilename;
             s >> materialFilename;
@@ -462,7 +530,7 @@ struct FormatChunk
 struct SoundData
 {
     WAVEFORMATEX wfex;        // 波形フォーマット
-    BYTE*        pBuffer;     // バッファの先頭アドレス
+    BYTE* pBuffer;     // バッファの先頭アドレス
     unsigned int bufferSize;  // バッファのサイズ
 };
 
@@ -521,8 +589,8 @@ SoundData SoundLoadWave(const char* filename)
 
     // ④ 読み込んだ音声データをreturn
     SoundData soundData = {};
-    soundData.wfex       = format.fmt;
-    soundData.pBuffer    = reinterpret_cast<BYTE*>(pBuffer);
+    soundData.wfex = format.fmt;
+    soundData.pBuffer = reinterpret_cast<BYTE*>(pBuffer);
     soundData.bufferSize = data.size;
 
     return soundData;
@@ -534,9 +602,9 @@ void SoundUnload(SoundData* soundData)
     // バッファのメモリを解放
     delete[] soundData->pBuffer;
 
-    soundData->pBuffer    = 0;
+    soundData->pBuffer = 0;
     soundData->bufferSize = 0;
-    soundData->wfex       = {};
+    soundData->wfex = {};
 }
 
 // 音声再生
@@ -553,7 +621,7 @@ void SoundPlayWave(IXAudio2* xAudio2, const SoundData& soundData)
     XAUDIO2_BUFFER buf{};
     buf.pAudioData = soundData.pBuffer;
     buf.AudioBytes = soundData.bufferSize;
-    buf.Flags      = XAUDIO2_END_OF_STREAM;
+    buf.Flags = XAUDIO2_END_OF_STREAM;
 
     // 波形データの再生
     result = pSourceVoice->SubmitSourceBuffer(&buf);
@@ -561,7 +629,7 @@ void SoundPlayWave(IXAudio2* xAudio2, const SoundData& soundData)
 }
 
 // キー入力状態（今フレーム・前フレーム）
-BYTE key[256]     = {};
+BYTE key[256] = {};
 BYTE keyPrev[256] = {};
 
 // キーを押した状態か
@@ -804,47 +872,52 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     D3D12_BLEND_DESC blendDesc{};
     blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     D3D12_RASTERIZER_DESC rasterizerDesc{};
-    rasterizerDesc.CullMode = D3D12_CULL_MODE_BACK;
+    // plane.objは片面ポリゴンなので、CullMode_BACKのままだと
+    // カメラや自身の回転で裏面を向いた瞬間に消えてしまう。
+    // デバッグカメラで自由に見て回る用途のため、両面とも描画されるようNONEにする。
+    rasterizerDesc.CullMode = D3D12_CULL_MODE_NONE;
     rasterizerDesc.FillMode = D3D12_FILL_MODE_SOLID;
 
     // シェーダーファイル名はプロジェクトのファイル名(Object3d_VS.hlsl / Object3d_PS.hlsl)に合わせる
     Microsoft::WRL::ComPtr<IDxcBlob> vertexShaderBlob = CompileShader(L"Object3d_VS.hlsl", L"vs_6_0", dxcUtils, dxcCompiler, includeHandler);
-    Microsoft::WRL::ComPtr<IDxcBlob> pixelShaderBlob  = CompileShader(L"Object3d_PS.hlsl", L"ps_6_0", dxcUtils, dxcCompiler, includeHandler);
+    Microsoft::WRL::ComPtr<IDxcBlob> pixelShaderBlob = CompileShader(L"Object3d_PS.hlsl", L"ps_6_0", dxcUtils, dxcCompiler, includeHandler);
 
     D3D12_DEPTH_STENCIL_DESC depthStencilDesc{};
-    depthStencilDesc.DepthEnable    = true;
+    depthStencilDesc.DepthEnable = true;
     depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    depthStencilDesc.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    depthStencilDesc.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsPipelineStateDesc{};
-    graphicsPipelineStateDesc.pRootSignature    = rootSignature.Get();
-    graphicsPipelineStateDesc.InputLayout       = inputLayoutDesc;
-    graphicsPipelineStateDesc.VS                = { vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize() };
-    graphicsPipelineStateDesc.PS                = { pixelShaderBlob->GetBufferPointer(),  pixelShaderBlob->GetBufferSize() };
-    graphicsPipelineStateDesc.BlendState        = blendDesc;
-    graphicsPipelineStateDesc.RasterizerState   = rasterizerDesc;
-    graphicsPipelineStateDesc.NumRenderTargets  = 1;
-    graphicsPipelineStateDesc.RTVFormats[0]     = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    graphicsPipelineStateDesc.pRootSignature = rootSignature.Get();
+    graphicsPipelineStateDesc.InputLayout = inputLayoutDesc;
+    graphicsPipelineStateDesc.VS = { vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize() };
+    graphicsPipelineStateDesc.PS = { pixelShaderBlob->GetBufferPointer(),  pixelShaderBlob->GetBufferSize() };
+    graphicsPipelineStateDesc.BlendState = blendDesc;
+    graphicsPipelineStateDesc.RasterizerState = rasterizerDesc;
+    graphicsPipelineStateDesc.NumRenderTargets = 1;
+    graphicsPipelineStateDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     graphicsPipelineStateDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    graphicsPipelineStateDesc.SampleDesc.Count  = 1;
-    graphicsPipelineStateDesc.SampleMask        = D3D12_DEFAULT_SAMPLE_MASK;
+    graphicsPipelineStateDesc.SampleDesc.Count = 1;
+    graphicsPipelineStateDesc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
     graphicsPipelineStateDesc.DepthStencilState = depthStencilDesc;
-    graphicsPipelineStateDesc.DSVFormat         = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    graphicsPipelineStateDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 
     Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipelineState;
     hr = device->CreateGraphicsPipelineState(&graphicsPipelineStateDesc, IID_PPV_ARGS(graphicsPipelineState.GetAddressOf()));
     assert(SUCCEEDED(hr));
 
-    // モデル読み込み(resources/axis.obj。必要に応じてファイル名を変更してください)
-    ModelData modelData = LoadObjFile("resources", "axis.obj");
+    // モデル読み込み(resources/plane.obj。必要に応じてファイル名を変更してください)
+    ModelData modelData = LoadObjFile("resources", "plane.obj");
+    // ★診断用: 読み込めた頂点数を確認する(0ならOBJ読み込み自体が失敗している)
+    Log(std::format("modelData.vertices.size() = {}\n", modelData.vertices.size()));
 
-    // 頂点リソースを作る
+    // Model用 頂点リソース(共有ジオメトリ。Modelタイプのオブジェクトは全てこれを使い回す)
     Microsoft::WRL::ComPtr<ID3D12Resource> vertexResource = CreateBufferResource(device, sizeof(VertexData) * modelData.vertices.size());
 
     D3D12_VERTEX_BUFFER_VIEW vertexBufferView{};
     vertexBufferView.BufferLocation = vertexResource->GetGPUVirtualAddress();
-    vertexBufferView.SizeInBytes    = UINT(sizeof(VertexData) * modelData.vertices.size());
-    vertexBufferView.StrideInBytes  = sizeof(VertexData);
+    vertexBufferView.SizeInBytes = UINT(sizeof(VertexData) * modelData.vertices.size());
+    vertexBufferView.StrideInBytes = sizeof(VertexData);
 
     // 頂点リソースにデータを書き込む
     VertexData* vertexData = nullptr;
@@ -852,34 +925,17 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     std::memcpy(vertexData, modelData.vertices.data(), sizeof(VertexData) * modelData.vertices.size());
     vertexResource->Unmap(0, nullptr);
 
-    // モデル用 Material
-    Microsoft::WRL::ComPtr<ID3D12Resource> materialResource = CreateBufferResource(device, sizeof(Material));
-    Material* materialData2 = nullptr;
-    materialResource->Map(0, nullptr, reinterpret_cast<void**>(&materialData2));
-    materialData2->color          = { 1.0f, 1.0f, 1.0f, 1.0f };
-    materialData2->enableLighting = true;
-    materialData2->uvTransform    = MakeIdentity4x4();
-
-    // モデル用 TransformationMatrix
-    Microsoft::WRL::ComPtr<ID3D12Resource> wvpResource = CreateBufferResource(device, sizeof(TransformationMatrix));
-    TransformationMatrix* transformationMatrixData = nullptr;
-    wvpResource->Map(0, nullptr, reinterpret_cast<void**>(&transformationMatrixData));
-    transformationMatrixData->WVP   = MakeIdentity4x4();
-    transformationMatrixData->World = MakeIdentity4x4();
-
-    Transform transform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
-
     // デバッグカメラ(マウス操作でカメラを制御する)
     DebugCamera debugCamera;
     debugCamera.Initialize();
 
-    // Sprite
+    // Sprite用 頂点リソース(共有ジオメトリ。Spriteタイプのオブジェクトは全てこれを使い回す)
     Microsoft::WRL::ComPtr<ID3D12Resource> vertexResourceSprite = CreateBufferResource(device, sizeof(VertexData) * 4);
 
     D3D12_VERTEX_BUFFER_VIEW vertexBufferViewSprite{};
     vertexBufferViewSprite.BufferLocation = vertexResourceSprite->GetGPUVirtualAddress();
-    vertexBufferViewSprite.SizeInBytes    = sizeof(VertexData) * 4;
-    vertexBufferViewSprite.StrideInBytes  = sizeof(VertexData);
+    vertexBufferViewSprite.SizeInBytes = sizeof(VertexData) * 4;
+    vertexBufferViewSprite.StrideInBytes = sizeof(VertexData);
 
     VertexData* vertexDataSprite = nullptr;
     vertexResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&vertexDataSprite));
@@ -901,13 +957,13 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     }
     vertexResourceSprite->Unmap(0, nullptr);
 
-    // Sprite用 IndexResource
+    // Sprite用 IndexResource(共有ジオメトリ)
     Microsoft::WRL::ComPtr<ID3D12Resource> indexResourceSprite = CreateBufferResource(device, sizeof(uint32_t) * 6);
 
     D3D12_INDEX_BUFFER_VIEW indexBufferViewSprite{};
     indexBufferViewSprite.BufferLocation = indexResourceSprite->GetGPUVirtualAddress();
-    indexBufferViewSprite.SizeInBytes    = sizeof(uint32_t) * 6;
-    indexBufferViewSprite.Format         = DXGI_FORMAT_R32_UINT;
+    indexBufferViewSprite.SizeInBytes = sizeof(uint32_t) * 6;
+    indexBufferViewSprite.Format = DXGI_FORMAT_R32_UINT;
 
     // インデックスリソースにデータを書き込む
     uint32_t* indexDataSprite = nullptr;
@@ -916,38 +972,18 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     indexDataSprite[3] = 1;    indexDataSprite[4] = 3;    indexDataSprite[5] = 2;
     indexResourceSprite->Unmap(0, nullptr);
 
-    // Sprite用 TransformationMatrix
-    Microsoft::WRL::ComPtr<ID3D12Resource> transformationMatrixResourceSprite = CreateBufferResource(device, sizeof(TransformationMatrix));
-    TransformationMatrix* transformationMatrixDataSprite = nullptr;
-    transformationMatrixResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&transformationMatrixDataSprite));
-    transformationMatrixDataSprite->WVP   = MakeIdentity4x4();
-    transformationMatrixDataSprite->World = MakeIdentity4x4();
-
-    // Sprite用 Material
-    Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceSprite = CreateBufferResource(device, sizeof(Material));
-    Material* materialDataSprite = nullptr;
-    materialResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&materialDataSprite));
-    materialDataSprite->color          = { 1.0f, 1.0f, 1.0f, 1.0f };
-    materialDataSprite->enableLighting = false;
-    materialDataSprite->uvTransform    = MakeIdentity4x4();
-
-    Transform transformSprite{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
-    // UVTransform用の変数
-    Transform uvTransformSprite{
-        {1.0f, 1.0f, 1.0f},  // scale
-        {0.0f, 0.0f, 0.0f},  // rotate
-        {0.0f, 0.0f, 0.0f},  // translate
-    };
-
-    // DirectionalLight リソース
+    // DirectionalLight リソース(シーン共通の光源)
     Microsoft::WRL::ComPtr<ID3D12Resource> directionalLightResource = CreateBufferResource(device, sizeof(DirectionalLight));
     DirectionalLight* directionalLightData = nullptr;
     directionalLightResource->Map(0, nullptr, reinterpret_cast<void**>(&directionalLightData));
-    directionalLightData->color     = { 1.0f, 1.0f, 1.0f, 1.0f };
+    directionalLightData->color = { 1.0f, 1.0f, 1.0f, 1.0f };
     directionalLightData->direction = { 0.0f, -1.0f, 0.0f };
     directionalLightData->intensity = 1.0f;
 
-    bool useMonsterBall = true;
+    // ImGuiの「Create」ボタンで動的に生成・削除されるオブジェクト一覧
+    std::vector<GameObject> gameObjects;
+    // Createで生成するタイプの選択状態(0:Sprite, 1:Model)
+    int createTypeIndex = 0;
 
     D3D12_VIEWPORT viewport{ 0.0f, 0.0f, (float)kClientWidth, (float)kClientHeight, 0.0f, 1.0f };
     D3D12_RECT scissorRect{ 0, 0, kClientWidth, kClientHeight };
@@ -996,7 +1032,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     intermediateResource.Reset();
     intermediateResource2.Reset();
 
-    // SRV作成 (uvChecker)
+    // SRV作成 (uvChecker / Sprite用)
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
     srvDesc.Format = metadata.format;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1006,7 +1042,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     D3D12_GPU_DESCRIPTOR_HANDLE textureSrvHandleGPU = GetGPUDescriptorHandle(srvDescriptorHeap, desriptorSizeSRV, 1);
     device->CreateShaderResourceView(textureResource.Get(), &srvDesc, textureSrvHandleCPU);
 
-    // SRV作成 (モデルのテクスチャ)
+    // SRV作成 (モデルのテクスチャ / useMonsterBall=true時に使用)
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc2{};
     srvDesc2.Format = metadata2.format;
     srvDesc2.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1095,54 +1131,103 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             ImGui::NewFrame();
 #endif
 
-            transform.rotate.y += 0.03f;
-
             // デバッグカメラの更新(マウス入力を取得してビュー行列を計算)
             debugCamera.Update(hwnd);
 
-            // モデル用 行列計算
-            Matrix4x4 worldMatrix = MakeAffineMatrix(transform.scale, transform.rotate, transform.translate);
-            Matrix4x4 viewMatrix = debugCamera.GetViewMatrix();
-            Matrix4x4 projectionMatrix = MakePerspectiveFovMatrix(
+            // 共通で使うView/Projection(Model用は透視投影、Sprite用は正射影)
+            Matrix4x4 viewMatrixModel = debugCamera.GetViewMatrix();
+            Matrix4x4 projectionMatrixModel = MakePerspectiveFovMatrix(
                 0.45f,
                 float(kClientWidth) / float(kClientHeight),
                 0.1f,
                 100.0f
             );
-            Matrix4x4 worldViewProjectionMatrix = Multiply(worldMatrix, Multiply(viewMatrix, projectionMatrix));
-            transformationMatrixData->WVP   = worldViewProjectionMatrix;
-            transformationMatrixData->World = worldMatrix;
-
-            // Sprite用 行列計算
-            Matrix4x4 worldMatrixSprite = MakeAffineMatrix(transformSprite.scale, transformSprite.rotate, transformSprite.translate);
             Matrix4x4 viewMatrixSprite = MakeIdentity4x4();
             Matrix4x4 projectionMatrixSprite = MakeOrthographicMatrix(0.0f, 0.0f, float(kClientWidth), float(kClientHeight), 0.0f, 100.0f);
-            Matrix4x4 worldViewProjectionMatrixSprite = Multiply(worldMatrixSprite, Multiply(viewMatrixSprite, projectionMatrixSprite));
-            transformationMatrixDataSprite->WVP   = worldViewProjectionMatrixSprite;
-            transformationMatrixDataSprite->World = worldMatrixSprite;
+
+            // 生成済みの全GameObjectについてWVP行列・UVTransformを更新
+            for (auto& obj : gameObjects) {
+                Matrix4x4 worldMatrix = MakeAffineMatrix(obj.transform.scale, obj.transform.rotate, obj.transform.translate);
+                Matrix4x4 wvp;
+                if (obj.IsSprite()) {
+                    wvp = Multiply(worldMatrix, Multiply(viewMatrixSprite, projectionMatrixSprite));
+
+                    // UVTransform行列を生成してMaterialにセット (SRTの順)
+                    Matrix4x4 uvTransformMatrix = MakeScaleMatrix(obj.uvTransform.scale);
+                    uvTransformMatrix = Multiply(uvTransformMatrix, MakeRotateZMatrix(obj.uvTransform.rotate.z));
+                    uvTransformMatrix = Multiply(uvTransformMatrix, MakeTranslateMatrix(obj.uvTransform.translate));
+                    obj.materialData->uvTransform = uvTransformMatrix;
+                }
+                else {
+                    wvp = Multiply(worldMatrix, Multiply(viewMatrixModel, projectionMatrixModel));
+                }
+                obj.transformData->WVP = wvp;
+                obj.transformData->World = worldMatrix;
+            }
 
 #ifdef USE_IMGUI
             ImGui::Begin("Settings");
-            ImGui::Text("Camera: L-Drag=Pan  R-Drag=Rotate  M-Drag=Zoom");
-            ImGui::ColorEdit4("color", &materialData2->color.x);
-            ImGui::Checkbox("enableLighting", reinterpret_cast<bool*>(&materialData2->enableLighting));
-            ImGui::ColorEdit4("colorSprite", &materialDataSprite->color.x);
-            ImGui::DragFloat3("translateSprite", &transformSprite.translate.x, 1.0f);
-            ImGui::Checkbox("useMonsterBall", &useMonsterBall);
-            ImGui::ColorEdit4("LightColor", &directionalLightData->color.x);
-            ImGui::DragFloat3("LightDirection", &directionalLightData->direction.x, 0.01f);
-            ImGui::DragFloat("Intensity", &directionalLightData->intensity, 0.01f);
-            // UVTransform編集 (UV座標系はxy平面なので回転軸はz)
-            ImGui::DragFloat2("UVTranslate", &uvTransformSprite.translate.x, 0.01f, -10.0f, 10.0f);
-            ImGui::DragFloat2("UVScale",     &uvTransformSprite.scale.x,     0.01f, -10.0f, 10.0f);
-            ImGui::SliderAngle("UVRotate",   &uvTransformSprite.rotate.z);
-            ImGui::End();
 
-            // UVTransform行列を生成してSpriteのMaterialにセット (SRTの順)
-            Matrix4x4 uvTransformMatrix = MakeScaleMatrix(uvTransformSprite.scale);
-            uvTransformMatrix = Multiply(uvTransformMatrix, MakeRotateZMatrix(uvTransformSprite.rotate.z));
-            uvTransformMatrix = Multiply(uvTransformMatrix, MakeTranslateMatrix(uvTransformSprite.translate));
-            materialDataSprite->uvTransform = uvTransformMatrix;
+            // ---- オブジェクトの生成 ----
+            const char* typeLabels[] = { "Sprite", "Model" };
+            ImGui::Combo("Type", &createTypeIndex, typeLabels, IM_ARRAYSIZE(typeLabels));
+            if (ImGui::Button("Create")) {
+                ObjectType newType = (createTypeIndex == 0) ? ObjectType::Sprite : ObjectType::Model;
+                gameObjects.push_back(CreateGameObject(device, newType));
+            }
+
+            ImGui::Separator();
+
+            // ---- 生成済みオブジェクトの一覧・編集・削除 ----
+            int deleteIndex = -1;
+            for (size_t i = 0; i < gameObjects.size(); ++i) {
+                GameObject& obj = gameObjects[i];
+                ImGui::PushID(static_cast<int>(i));
+
+                std::string header = std::format("Object [{}] {}", i, obj.IsSprite() ? "Sprite" : "Model");
+                if (ImGui::TreeNode(header.c_str())) {
+                    ImGui::DragFloat3("Translate", &obj.transform.translate.x, 0.01f);
+                    ImGui::DragFloat3("Rotate", &obj.transform.rotate.x, 0.01f);
+                    ImGui::DragFloat3("Scale", &obj.transform.scale.x, 0.01f);
+
+                    if (ImGui::TreeNode("Material")) {
+                        ImGui::ColorEdit4("Color", &obj.materialData->color.x);
+                        ImGui::Checkbox("enableLighting", reinterpret_cast<bool*>(&obj.materialData->enableLighting));
+                        if (obj.IsSprite()) {
+                            ImGui::DragFloat2("UVTranslate", &obj.uvTransform.translate.x, 0.01f, -10.0f, 10.0f);
+                            ImGui::DragFloat2("UVScale", &obj.uvTransform.scale.x, 0.01f, -10.0f, 10.0f);
+                            ImGui::SliderAngle("UVRotate", &obj.uvTransform.rotate.z);
+                        }
+                        else {
+                            ImGui::Checkbox("useMonsterBall", &obj.useMonsterBall);
+                        }
+                        ImGui::TreePop();
+                    }
+
+                    if (ImGui::Button("Delete")) {
+                        deleteIndex = static_cast<int>(i);
+                    }
+
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            // ループの外で削除する(ループ中にvectorを変更しない)
+            if (deleteIndex >= 0) {
+                gameObjects.erase(gameObjects.begin() + deleteIndex);
+            }
+
+            ImGui::Separator();
+
+            // ---- ライト設定(シーン共通) ----
+            if (ImGui::TreeNode("Light")) {
+                ImGui::ColorEdit4("LightColor", &directionalLightData->color.x);
+                ImGui::DragFloat3("LightDirection", &directionalLightData->direction.x, 0.01f);
+                ImGui::DragFloat("Intensity", &directionalLightData->intensity, 0.01f);
+                ImGui::TreePop();
+            }
+
+            ImGui::End();
 #endif
 
 #ifdef USE_IMGUI
@@ -1155,7 +1240,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barrier.Transition.pResource = swapChainResources[backBufferIndex].Get();
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-            barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             commandList->ResourceBarrier(1, &barrier);
 
             D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = dsvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
@@ -1164,10 +1249,12 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
             commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-#ifdef USE_IMGUI
+            // ★修正: SRVディスクリプタヒープの設定をUSE_IMGUIの外に移動。
+            //   これが#ifdefの中にしかないと、USE_IMGUIが無効なビルドでは
+            //   SetGraphicsRootDescriptorTable(2, ...)が未設定のヒープを参照し、
+            //   テクスチャ付きの描画(Sprite/Model問わず)が正しく行われない。
             ID3D12DescriptorHeap* descriptorHeaps[] = { srvDescriptorHeap.Get() };
             commandList->SetDescriptorHeaps(1, descriptorHeaps);
-#endif
 
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissorRect);
@@ -1175,33 +1262,31 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->SetPipelineState(graphicsPipelineState.Get());
             commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-            // モデルの描画
-            commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
-            commandList->SetGraphicsRootConstantBufferView(0, materialResource->GetGPUVirtualAddress());
-            commandList->SetGraphicsRootConstantBufferView(1, wvpResource->GetGPUVirtualAddress());
-            commandList->SetGraphicsRootConstantBufferView(3, directionalLightResource->GetGPUVirtualAddress());
-            if (useMonsterBall) {
-                commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU2);
-            } else {
-                commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
-            }
-            commandList->DrawInstanced(UINT(modelData.vertices.size()), 1, 0, 0);
+            // 生成済みの全GameObjectを描画
+            for (auto& obj : gameObjects) {
+                commandList->SetGraphicsRootConstantBufferView(0, obj.materialResource->GetGPUVirtualAddress());
+                commandList->SetGraphicsRootConstantBufferView(1, obj.transformResource->GetGPUVirtualAddress());
+                commandList->SetGraphicsRootConstantBufferView(3, directionalLightResource->GetGPUVirtualAddress());
 
-            // Spriteの描画
-            commandList->IASetVertexBuffers(0, 1, &vertexBufferViewSprite);
-            commandList->IASetIndexBuffer(&indexBufferViewSprite);
-            commandList->SetGraphicsRootConstantBufferView(0, materialResourceSprite->GetGPUVirtualAddress());
-            commandList->SetGraphicsRootConstantBufferView(1, transformationMatrixResourceSprite->GetGPUVirtualAddress());
-            commandList->SetGraphicsRootConstantBufferView(3, directionalLightResource->GetGPUVirtualAddress());
-            commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
-            commandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                if (obj.IsSprite()) {
+                    commandList->IASetVertexBuffers(0, 1, &vertexBufferViewSprite);
+                    commandList->IASetIndexBuffer(&indexBufferViewSprite);
+                    commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
+                    commandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                }
+                else {
+                    commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
+                    commandList->SetGraphicsRootDescriptorTable(2, obj.useMonsterBall ? textureSrvHandleGPU2 : textureSrvHandleGPU);
+                    commandList->DrawInstanced(UINT(modelData.vertices.size()), 1, 0, 0);
+                }
+            }
 
 #ifdef USE_IMGUI
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList.Get());
 #endif
 
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             commandList->ResourceBarrier(1, &barrier);
 
             commandList->Close();
