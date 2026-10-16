@@ -1196,10 +1196,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
             commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-#ifdef USE_IMGUI
             ID3D12DescriptorHeap* descriptorHeaps[] = { srvDescriptorHeap.Get() };
             commandList->SetDescriptorHeaps(1, descriptorHeaps);
-#endif
 
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissorRect);
