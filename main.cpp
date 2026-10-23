@@ -19,16 +19,14 @@
 #include "Matrix4x4.h"
 #include "Transform.h"
 #include "DebugCamera.h"
+// 入力クラス (DirectInputのdefine/includeはInput.h側に移動済み)
+#include "Input.h"
 // OBJファイル読み込みに必要
 #include <fstream>
 #include <sstream>
 // XAudio2
 #include <xaudio2.h>
 #pragma comment(lib, "xaudio2.lib")
-// DirectInput
-#define DIRECTINPUT_VERSION 0x0800
-#include <dinput.h>
-#pragma comment(lib, "dinput8.lib")
 #ifdef USE_IMGUI
 #include "externals/imgui/imgui.h"
 #include "externals/imgui/imgui_impl_dx12.h"
@@ -564,30 +562,6 @@ void SoundPlayWave(IXAudio2* xAudio2, const SoundData& soundData)
     result = pSourceVoice->Start();
 }
 
-// キー入力状態（今フレーム・前フレーム）
-BYTE key[256] = {};
-BYTE keyPrev[256] = {};
-
-// キーを押した状態か
-bool IsKeyDown(uint8_t keyNumber) {
-    return key[keyNumber] != 0;
-}
-
-// キーを離した状態か
-bool IsKeyUp(uint8_t keyNumber) {
-    return key[keyNumber] == 0;
-}
-
-// キーを押した瞬間か（前フレーム：押していない、今フレーム：押している）
-bool IsKeyTriggered(uint8_t keyNumber) {
-    return keyPrev[keyNumber] == 0 && key[keyNumber] != 0;
-}
-
-// キーを離した瞬間か（前フレーム：押している、今フレーム：押していない）
-bool IsKeyReleased(uint8_t keyNumber) {
-    return keyPrev[keyNumber] != 0 && key[keyNumber] == 0;
-}
-
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 #ifdef USE_IMGUI
     if (ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam)) {
@@ -1039,26 +1013,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     // 音声再生
     SoundPlayWave(xAudio2.Get(), soundData1);
 
-    // DirectInputの初期化
-    IDirectInput8* directInput = nullptr;
-    hr = DirectInput8Create(
-        wc.hInstance, DIRECTINPUT_VERSION, IID_IDirectInput8,
-        (void**)&directInput, nullptr);
-    assert(SUCCEEDED(hr));
-
-    // キーボードデバイスの生成
-    IDirectInputDevice8* keyboard = nullptr;
-    hr = directInput->CreateDevice(GUID_SysKeyboard, &keyboard, NULL);
-    assert(SUCCEEDED(hr));
-
-    // 入力データ形式のセット
-    hr = keyboard->SetDataFormat(&c_dfDIKeyboard); // 標準形式
-    assert(SUCCEEDED(hr));
-
-    // 排他制御レベルのセット
-    hr = keyboard->SetCooperativeLevel(
-        hwnd, DISCL_FOREGROUND | DISCL_NONEXCLUSIVE | DISCL_NOWINKEY);
-    assert(SUCCEEDED(hr));
+    // 入力の初期化 (DirectInput/キーボードの生成はInputクラス内で行う)
+    Input* input = new Input();
+    input->Initialize(wc.hInstance, hwnd);
 
     //メインループ
     MSG msg{};
@@ -1068,34 +1025,28 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
             DispatchMessage(&msg);
         }
         else {
-            // キーボード情報の取得開始
-            keyboard->Acquire();
-
-            // 前フレームのキー状態を保存
-            memcpy(keyPrev, key, sizeof(key));
-
-            // 全キーの入力状態を取得する
-            keyboard->GetDeviceState(sizeof(key), key);
+            // 入力の更新
+            input->Update();
 
             // 左キーが押されていたら
-            if (key[DIK_LEFT]) {
+            if (input->PushKey(DIK_LEFT)) {
                 OutputDebugStringA("Hit LEFT\n");
             }
             // 右キーが押されていたら
-            if (key[DIK_RIGHT]) {
+            if (input->PushKey(DIK_RIGHT)) {
                 OutputDebugStringA("Hit RIGHT\n");
             }
             // 上キーが押されていたら
-            if (key[DIK_UP]) {
+            if (input->PushKey(DIK_UP)) {
                 OutputDebugStringA("Hit UP\n");
             }
             // 下キーが押されていたら
-            if (key[DIK_DOWN]) {
+            if (input->PushKey(DIK_DOWN)) {
                 OutputDebugStringA("Hit DOWN\n");
             }
 
             // SPACEキーが押された瞬間にデバッグカメラ／通常カメラを切り替え
-            if (IsKeyTriggered(DIK_SPACE)) {
+            if (input->TriggerKey(DIK_SPACE)) {
                 isDebugCamera = !isDebugCamera;
             }
 
@@ -1256,6 +1207,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 #endif
+
+    // 入力解放
+    delete input;
 
     // ComPtrで管理していないものだけ解放
     CloseHandle(fenceEvent);
