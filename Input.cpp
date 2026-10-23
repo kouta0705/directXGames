@@ -9,21 +9,21 @@ void Input::Initialize(HINSTANCE hInstance, HWND hwnd)
 {
     HRESULT result;
 
-    // DirectInputのインスタンス生成
+    
     result = DirectInput8Create(
         hInstance, DIRECTINPUT_VERSION, IID_IDirectInput8,
         reinterpret_cast<void**>(directInput.GetAddressOf()), nullptr);
     assert(SUCCEEDED(result));
 
-    // キーボードデバイスの生成
+    
     result = directInput->CreateDevice(GUID_SysKeyboard, keyboard.GetAddressOf(), nullptr);
     assert(SUCCEEDED(result));
 
-    // 入力データ形式のセット
-    result = keyboard->SetDataFormat(&c_dfDIKeyboard); // 標準形式
+   
+    result = keyboard->SetDataFormat(&c_dfDIKeyboard);
     assert(SUCCEEDED(result));
 
-    // 排他制御レベルのセット
+    
     result = keyboard->SetCooperativeLevel(
         hwnd, DISCL_FOREGROUND | DISCL_NONEXCLUSIVE | DISCL_NOWINKEY);
     assert(SUCCEEDED(result));
@@ -31,27 +31,32 @@ void Input::Initialize(HINSTANCE hInstance, HWND hwnd)
 
 void Input::Update()
 {
-    // 前回のキー入力を保存
+    
     std::memcpy(keyPre, key, sizeof(key));
 
-    // キーボード情報の取得開始
+  
     keyboard->Acquire();
 
-    // 全キーの入力情報を取得する
+   
     keyboard->GetDeviceState(sizeof(key), key);
 }
 
-bool Input::PushKey(BYTE keyNumber) const
+bool Input::PushKey(BYTE keyNumber)
 {
-    return key[keyNumber] != 0;
+    // 指定キーを押していればtrueを返す
+    if (key[keyNumber]) {
+        return true;
+    }
+    // そうでなければfalseを返す
+    return false;
 }
 
-bool Input::TriggerKey(BYTE keyNumber) const
+bool Input::TriggerKey(BYTE keyNumber)
 {
-    return keyPre[keyNumber] == 0 && key[keyNumber] != 0;
-}
-
-bool Input::ReleaseKey(BYTE keyNumber) const
-{
-    return keyPre[keyNumber] != 0 && key[keyNumber] == 0;
+   
+    if (!keyPre[keyNumber] && key[keyNumber]) {
+        return true;
+    }
+  
+    return false;
 }

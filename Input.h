@@ -1,9 +1,8 @@
 #pragma once
 #include <Windows.h>
 #include <wrl.h>
-#include <cstdint>
 
-#define DIRECTINPUT_VERSION 0x0800
+#define DIRECTINPUT_VERSION 0x0800 // DirectInputのバージョン指定
 #include <dinput.h>
 
 // 入力
@@ -15,32 +14,20 @@ public:
 public:
     // 初期化
     void Initialize(HINSTANCE hInstance, HWND hwnd);
-
     // 更新
     void Update();
 
-    /// <summary>
-    /// キーの押下をチェック
-    /// </summary>
-    /// <param name="keyNumber">キー番号( DIK_0 等)</param>
-    /// <returns>押されているか</returns>
-    bool PushKey(BYTE keyNumber) const;
+    
+    bool PushKey(BYTE keyNumber);
 
-    /// <summary>
-    /// キーのトリガーをチェック（押した瞬間）
-    /// </summary>
-    bool TriggerKey(BYTE keyNumber) const;
-
-    /// <summary>
-    /// キーを離した瞬間をチェック
-    /// </summary>
-    bool ReleaseKey(BYTE keyNumber) const;
+ 
+    bool TriggerKey(BYTE keyNumber);
 
 private:
-    // DirectInputのインスタンス
-    ComPtr<IDirectInput8> directInput;
-    // キーボードデバイス
+  
     ComPtr<IDirectInputDevice8> keyboard;
+   
+    ComPtr<IDirectInput8> directInput;
     // 全キーの状態
     BYTE key[256] = {};
     // 前回の全キーの状態
