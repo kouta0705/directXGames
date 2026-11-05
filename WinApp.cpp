@@ -74,3 +74,21 @@ void WinApp::Finalize()
     CloseWindow(hwnd);
     CoUninitialize();
 }
+
+bool WinApp::ProcessMessage()
+{
+    MSG msg{};
+
+    // Windowsのメッセージを受け取って処理する
+    if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    // アプリ終了メッセージが来たらtrueを返す
+    if (msg.message == WM_QUIT) {
+        return true;
+    }
+
+    return false;
+}
