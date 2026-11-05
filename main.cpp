@@ -996,7 +996,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     // 入力の初期化 (DirectInput/キーボードの生成はInputクラス内で行う)
     Input* input = new Input();
-    input->Initialize(winApp->GetHInstance(), winApp->GetHwnd());
+    input->Initialize(winApp);
 
     //メインループ
     MSG msg{};
