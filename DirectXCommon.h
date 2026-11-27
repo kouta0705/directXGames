@@ -18,6 +18,11 @@ public:
     // 初期化
     void Initialize(WinApp* winApp);
 
+    // 描画前処理
+    void PreDraw();
+    // 描画後処理
+    void PostDraw();
+
     // --- 他のクラスから使うためのゲッター ---
     ID3D12Device* GetDevice() const { return device_.Get(); }
     ID3D12GraphicsCommandList* GetCommandList() const { return commandList_.Get(); }

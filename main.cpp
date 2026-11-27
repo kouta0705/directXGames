@@ -1005,13 +1005,23 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     SoundUnload(&soundData1);
 #endif
 
-    // 初期化確認用のメインループ (メッセージ処理のみ)
+    // メインループ
     while (true) {
         // Windowsのメッセージ処理
         if (winApp->ProcessMessage()) {
             // ゲームループを抜ける
             break;
         }
+
+        // (入力の更新・シーンの更新は移植前なので省略中)
+
+        // 描画前処理
+        dxCommon->PreDraw();
+
+        // (シーンの描画: 3Dモデル・スプライトは移植前なので省略中)
+
+        // 描画後処理
+        dxCommon->PostDraw();
     }
 
     // DirectX解放 (ImGui終了・フェンスイベントのクローズはデストラクタで行う)
