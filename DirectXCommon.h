@@ -5,6 +5,9 @@
 #include <dxcapi.h>
 #include <cstdint>
 #include <array>
+#include <vector>
+
+#include "externals/DirectXTex/DirectXTex.h"
 
 #include "WinApp.h"
 
@@ -22,6 +25,21 @@ public:
     void PreDraw();
     // 描画後処理
     void PostDraw();
+
+    /// <summary>
+    /// テクスチャデータの転送
+    /// </summary>
+    /// <returns>中間リソース (GPUの転送完了まで解放しないこと)</returns>
+    [[nodiscard]]
+    Microsoft::WRL::ComPtr<ID3D12Resource> UploadTextureData(
+        const Microsoft::WRL::ComPtr<ID3D12Resource>& texture,
+        const DirectX::ScratchImage& mipImages);
+
+    /// <summary>
+    /// コマンドを実行してGPUの完了を待ち、コマンドリストを再び使える状態に戻す
+    /// (初期化中のテクスチャ転送などで使う。Presentは行わない)
+    /// </summary>
+    void ExecuteCommandAndWait();
 
     // --- 他のクラスから使うためのゲッター ---
     ID3D12Device* GetDevice() const { return device_.Get(); }
@@ -63,6 +81,7 @@ private:
         D3D12_DESCRIPTOR_HEAP_TYPE heapType, UINT numDescriptors, bool shaderVisible);
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateDepthStencilTextureResource(
         int32_t width, int32_t height);
+    Microsoft::WRL::ComPtr<ID3D12Resource> CreateBufferResource(size_t sizeInBytes);
 
 private:
     // WindowsAPI (借り物なのでdeleteしない)

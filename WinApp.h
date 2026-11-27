@@ -1,4 +1,10 @@
 #pragma once
+
+// ImGuiを使う (プロジェクト設定でUSE_IMGUIが未定義でも有効になるようにする)
+#ifndef USE_IMGUI
+#define USE_IMGUI
+#endif
+
 #include <Windows.h>
 #include <cstdint>
 

@@ -1,6 +1,8 @@
 #include "DirectXCommon.h"
 #include "Logger.h"
 #include <cassert>
+#include <vector>
+#include "externals/DirectXTex/d3dx12.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -138,6 +140,66 @@ void DirectXCommon::PostDraw()
     assert(SUCCEEDED(hr));
 
     // コマンドリストのリセット
+    hr = commandList_->Reset(commandAllocator_.Get(), nullptr);
+    assert(SUCCEEDED(hr));
+}
+
+// ======================================================
+// テクスチャデータの転送
+// ======================================================
+ComPtr<ID3D12Resource> DirectXCommon::UploadTextureData(
+    const ComPtr<ID3D12Resource>& texture, const DirectX::ScratchImage& mipImages)
+{
+    std::vector<D3D12_SUBRESOURCE_DATA> subresources;
+    DirectX::PrepareUpload(device_.Get(), mipImages.GetImages(), mipImages.GetImageCount(),
+        mipImages.GetMetadata(), subresources);
+
+    uint64_t intermediateSize = GetRequiredIntermediateSize(texture.Get(), 0, UINT(subresources.size()));
+    ComPtr<ID3D12Resource> intermediateResource = CreateBufferResource(intermediateSize);
+    UpdateSubresources(commandList_.Get(), texture.Get(), intermediateResource.Get(),
+        0, 0, UINT(subresources.size()), subresources.data());
+
+    // COPY_DEST → GENERIC_READ
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = texture.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_GENERIC_READ;
+    commandList_->ResourceBarrier(1, &barrier);
+
+    return intermediateResource;
+}
+
+// ======================================================
+// コマンドを実行してGPUの完了を待つ
+// ======================================================
+void DirectXCommon::ExecuteCommandAndWait()
+{
+    HRESULT hr;
+
+    // グラフィックスコマンドをクローズ
+    hr = commandList_->Close();
+    assert(SUCCEEDED(hr));
+
+    // GPUコマンドの実行
+    ID3D12CommandList* commandLists[] = { commandList_.Get() };
+    commandQueue_->ExecuteCommandLists(1, commandLists);
+
+    // Fenceの値を更新してシグナルを送る
+    fenceValue_++;
+    commandQueue_->Signal(fence_.Get(), fenceValue_);
+
+    // コマンド完了待ち
+    if (fence_->GetCompletedValue() < fenceValue_) {
+        fence_->SetEventOnCompletion(fenceValue_, fenceEvent_);
+        WaitForSingleObject(fenceEvent_, INFINITE);
+    }
+
+    // コマンドアロケーター・コマンドリストのリセット
+    hr = commandAllocator_->Reset();
+    assert(SUCCEEDED(hr));
     hr = commandList_->Reset(commandAllocator_.Get(), nullptr);
     assert(SUCCEEDED(hr));
 }
@@ -429,6 +491,26 @@ ComPtr<ID3D12Resource> DirectXCommon::CreateDepthStencilTextureResource(int32_t 
         &heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDesc,
         D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClearValue,
         IID_PPV_ARGS(&resource));
+    assert(SUCCEEDED(hr));
+    return resource;
+}
+
+ComPtr<ID3D12Resource> DirectXCommon::CreateBufferResource(size_t sizeInBytes)
+{
+    D3D12_HEAP_PROPERTIES uploadHeapProperties{ D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC resourceDesc{};
+    resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resourceDesc.Width = sizeInBytes;
+    resourceDesc.Height = 1;
+    resourceDesc.DepthOrArraySize = 1;
+    resourceDesc.MipLevels = 1;
+    resourceDesc.SampleDesc.Count = 1;
+    resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> resource;
+    HRESULT hr = device_->CreateCommittedResource(
+        &uploadHeapProperties, D3D12_HEAP_FLAG_NONE, &resourceDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource));
     assert(SUCCEEDED(hr));
     return resource;
 }
