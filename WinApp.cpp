@@ -1,5 +1,8 @@
 #include "WinApp.h"
 #include <cassert>
+#include <timeapi.h>
+
+#pragma comment(lib, "winmm.lib")
 
 #ifdef USE_IMGUI
 #include "externals/imgui/imgui.h"
@@ -36,6 +39,9 @@ void WinApp::Initialize()
     // COMの初期化
     HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
     assert(SUCCEEDED(hr));
+
+    // システムタイマーの分解能を上げる
+    timeBeginPeriod(1);
 
     // ウィンドウクラスの登録
     wc.lpfnWndProc = WindowProc;

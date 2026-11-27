@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <array>
 #include <vector>
+#include <chrono>
 
 #include "externals/DirectXTex/DirectXTex.h"
 
@@ -76,6 +77,11 @@ private:
     void CreateDXCCompiler();            // DXCコンパイラの生成
     void InitializeImGui();              // ImGuiの初期化
 
+    // FPS固定初期化
+    void InitializeFixFPS();
+    // FPS固定更新
+    void UpdateFixFPS();
+
     // ==== 内部ヘルパー ====
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> CreateDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE heapType, UINT numDescriptors, bool shaderVisible);
@@ -123,6 +129,9 @@ private:
     // ビューポート / シザリング矩形
     D3D12_VIEWPORT viewport_{};
     D3D12_RECT scissorRect_{};
+
+    // 記録時間(FPS固定用)
+    std::chrono::steady_clock::time_point reference_;
 
     // DXCコンパイラ
     Microsoft::WRL::ComPtr<IDxcUtils> dxcUtils_;
