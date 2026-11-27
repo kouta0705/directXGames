@@ -6,11 +6,9 @@
 #include <dxgi1_6.h>
 #include <cassert>
 #include <dxcapi.h>
-#pragma comment(lib, "dxcompiler.lib")
 #include <dxgidebug.h>
 #pragma comment(lib, "dxguid.lib")
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
+// d3d12.lib / dxgi.lib / dxcompiler.lib のリンクは DirectXCommon.cpp に移植済み
 #include "externals/DirectXTex/DirectXTex.h"
 #include "externals/DirectXTex/d3dx12.h"
 #include <vector>
@@ -23,6 +21,12 @@
 #include "Input.h"
 // WindowsAPI
 #include "WinApp.h"
+// DirectX基盤
+#include "DirectXCommon.h"
+// ログ出力
+#include "Logger.h"
+// 文字列変換
+#include "StringUtility.h"
 // OBJファイル読み込みに必要
 #include <fstream>
 #include <sstream>
@@ -101,25 +105,9 @@ struct D3DResourceLeakChecker {
     }
 };
 
-std::wstring ConvertString(const std::string& str) {
-    if (str.empty()) return {};
-    auto sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), NULL, 0);
-    std::wstring result(sizeNeeded, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), result.data(), sizeNeeded);
-    return result;
-}
-
-std::string ConvertString(const std::wstring& wstr) {
-    if (wstr.empty()) return {};
-    auto sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), NULL, 0, NULL, NULL);
-    std::string result(sizeNeeded, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), result.data(), sizeNeeded, NULL, NULL);
-    return result;
-}
-
-void Log(const std::string& message) {
-    OutputDebugStringA(message.c_str());
-}
+// ※ ConvertString は StringUtility に、Log は Logger に移動した
+// ※ CreateDescriptorHeap / CreateDepthStencilTextureResource /
+//    GetCPUDescriptorHandle / GetGPUDescriptorHandle は DirectXCommon に移動した
 
 // 引数をComPtr版に変更
 Microsoft::WRL::ComPtr<ID3D12Resource> CreateBufferResource(const Microsoft::WRL::ComPtr<ID3D12Device>& device, size_t sizeInBytes) {
@@ -145,28 +133,9 @@ Microsoft::WRL::ComPtr<ID3D12Resource> CreateBufferResource(const Microsoft::WRL
     return resource;
 }
 
-Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> CreateDescriptorHeap(
-    const Microsoft::WRL::ComPtr<ID3D12Device>& device, D3D12_DESCRIPTOR_HEAP_TYPE heapType,
-    UINT numDescriptors, bool shaderVisible)
-{
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptorHeap;
-    D3D12_DESCRIPTOR_HEAP_DESC descriptorHeapDesc{};
-    descriptorHeapDesc.Type = heapType;
-    descriptorHeapDesc.NumDescriptors = numDescriptors;
-    if (shaderVisible) {
-        descriptorHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    }
-    else {
-        descriptorHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    }
-    HRESULT hr = device->CreateDescriptorHeap(&descriptorHeapDesc, IID_PPV_ARGS(descriptorHeap.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-    return descriptorHeap;
-}
-
 DirectX::ScratchImage LoadTexture(const std::string& filePath) {
     DirectX::ScratchImage image{};
-    std::wstring filePathW = ConvertString(filePath);
+    std::wstring filePathW = StringUtility::ConvertString(filePath);
     HRESULT hr = DirectX::LoadFromWICFile(filePathW.c_str(), DirectX::WIC_FLAGS_FORCE_SRGB, nullptr, image);
     assert(SUCCEEDED(hr));
 
@@ -202,35 +171,6 @@ Microsoft::WRL::ComPtr<ID3D12Resource> CreateTextureResource(const Microsoft::WR
     return resource;
 }
 
-Microsoft::WRL::ComPtr<ID3D12Resource> CreateDepthStencilTextureResource(const Microsoft::WRL::ComPtr<ID3D12Device>& device, int32_t width, int32_t height) {
-    D3D12_RESOURCE_DESC resourceDesc{};
-    resourceDesc.Width = width;
-    resourceDesc.Height = height;
-    resourceDesc.MipLevels = 1;
-    resourceDesc.DepthOrArraySize = 1;
-    resourceDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    resourceDesc.SampleDesc.Count = 1;
-    resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    resourceDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
-    D3D12_HEAP_PROPERTIES heapProperties{};
-    heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    D3D12_CLEAR_VALUE depthClearValue{};
-    depthClearValue.DepthStencil.Depth = 1.0f;
-    depthClearValue.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-
-    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-    HRESULT hr = device->CreateCommittedResource(
-        &heapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &resourceDesc,
-        D3D12_RESOURCE_STATE_DEPTH_WRITE,
-        &depthClearValue, IID_PPV_ARGS(resource.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-    return resource;
-}
-
 [[nodiscard]]
 Microsoft::WRL::ComPtr<ID3D12Resource> UploadTextureData(
     const Microsoft::WRL::ComPtr<ID3D12Resource>& texture,
@@ -257,20 +197,6 @@ Microsoft::WRL::ComPtr<ID3D12Resource> UploadTextureData(
     return intermediateResource;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandle(const Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>& descriptorHeap, uint32_t descriptorSize, uint32_t index)
-{
-    D3D12_CPU_DESCRIPTOR_HANDLE handleCPU = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
-    handleCPU.ptr += (descriptorSize * index);
-    return handleCPU;
-}
-
-D3D12_GPU_DESCRIPTOR_HANDLE GetGPUDescriptorHandle(const Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>& descriptorHeap, uint32_t descriptorSize, uint32_t index)
-{
-    D3D12_GPU_DESCRIPTOR_HANDLE handleGPU = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
-    handleGPU.ptr += (descriptorSize * index);
-    return handleGPU;
-}
-
 Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(
     const std::wstring& filePath,
     const wchar_t* profile,
@@ -278,7 +204,7 @@ Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(
     const Microsoft::WRL::ComPtr<IDxcCompiler3>& dxcCompiler,
     const Microsoft::WRL::ComPtr<IDxcIncludeHandler>& includeHandler)
 {
-    Log(ConvertString(std::format(L"Begin CompileShader, path:{}, profile:{}\n", filePath, profile)));
+    Logger::Log(StringUtility::ConvertString(std::format(L"Begin CompileShader, path:{}, profile:{}\n", filePath, profile)));
 
     Microsoft::WRL::ComPtr<IDxcBlobEncoding> shaderSource;
     HRESULT hr = dxcUtils->LoadFile(filePath.c_str(), nullptr, shaderSource.GetAddressOf());
@@ -301,14 +227,14 @@ Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(
     Microsoft::WRL::ComPtr<IDxcBlobUtf8> shaderError;
     shaderResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(shaderError.GetAddressOf()), nullptr);
     if (shaderError != nullptr && shaderError->GetStringLength() != 0) {
-        Log(shaderError->GetStringPointer());
+        Logger::Log(shaderError->GetStringPointer());
         assert(false);
     }
 
     Microsoft::WRL::ComPtr<IDxcBlob> shaderBlob;
     hr = shaderResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(shaderBlob.GetAddressOf()), nullptr);
     assert(SUCCEEDED(hr));
-    Log(ConvertString(std::format(L"Compile Succeeded, path:{}, profile:{}\n", filePath, profile)));
+    Logger::Log(StringUtility::ConvertString(std::format(L"Compile Succeeded, path:{}, profile:{}\n", filePath, profile)));
     // ComPtrなのでRelease不要
     return shaderBlob;
 }
@@ -574,117 +500,31 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     // ポインタ
     WinApp* winApp = nullptr;
+    DirectXCommon* dxCommon = nullptr;
 
     // WindowsAPIの初期化
     // (COMの初期化・ウィンドウクラス登録・ウィンドウ生成と表示を含む)
     winApp = new WinApp();
     winApp->Initialize();
 
+    // DirectXの初期化
+    dxCommon = new DirectXCommon();
+    dxCommon->Initialize(winApp);
+
+    // ======================================================
+    // 以下は「初期化部分だけ確認する」ため一旦無効化している。
+    // 毎フレームの処理などを DirectXCommon に移植するときに、
+    // 少しずつ有効に戻していく。
+    // (device / commandList などは dxCommon->GetDevice() 等に置き換える)
+    // ======================================================
+#if 0
     // XAudio2関連変数
     // IXAudio2はCOMオブジェクトなのでComPtrで管理
     Microsoft::WRL::ComPtr<IXAudio2> xAudio2;
     // IXAudio2MasteringVoiceにはRelease()がないのでComPtrで管理できない
     IXAudio2MasteringVoice* masterVoice;
 
-    Microsoft::WRL::ComPtr<ID3D12Debug1> debugController;
-#ifdef _DEBUG
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(debugController.GetAddressOf())))) {
-        debugController->EnableDebugLayer();
-        debugController->SetEnableGPUBasedValidation(TRUE);
-    }
-#endif
-
-    Microsoft::WRL::ComPtr<IDXGIFactory7> dxFactory;
-    HRESULT hr = CreateDXGIFactory(IID_PPV_ARGS(dxFactory.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-
-    Microsoft::WRL::ComPtr<IDXGIAdapter4> useAdapter;
-    for (UINT i = 0; dxFactory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(useAdapter.GetAddressOf())) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC3 adapterDesc{};
-        useAdapter->GetDesc3(&adapterDesc);
-        if (!(adapterDesc.Flags & DXGI_ADAPTER_FLAG3_SOFTWARE)) break;
-        useAdapter.Reset();
-    }
-
-    Microsoft::WRL::ComPtr<ID3D12Device> device;
-    D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0 };
-    for (auto level : featureLevels) {
-        if (SUCCEEDED(D3D12CreateDevice(useAdapter.Get(), level, IID_PPV_ARGS(device.GetAddressOf())))) break;
-    }
-
-#ifdef _DEBUG
-    Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
-    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(infoQueue.GetAddressOf())))) {
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
-        D3D12_MESSAGE_ID denyIds[] = { D3D12_MESSAGE_ID_RESOURCE_BARRIER_MISMATCHING_COMMAND_LIST_TYPE };
-        D3D12_MESSAGE_SEVERITY severities[] = { D3D12_MESSAGE_SEVERITY_INFO };
-        D3D12_INFO_QUEUE_FILTER filter{};
-        filter.DenyList.NumIDs = _countof(denyIds);
-        filter.DenyList.pIDList = denyIds;
-        filter.DenyList.NumSeverities = _countof(severities);
-        filter.DenyList.pSeverityList = severities;
-        infoQueue->PushStorageFilter(&filter);
-        // ComPtrなのでRelease不要
-    }
-#endif
-
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> commandQueue;
-    D3D12_COMMAND_QUEUE_DESC commandQueueDesc{};
-    hr = device->CreateCommandQueue(&commandQueueDesc, IID_PPV_ARGS(commandQueue.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commandAllocator;
-    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(commandAllocator.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList;
-    hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator.Get(), nullptr, IID_PPV_ARGS(commandList.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-
-    Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain;
-    DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
-    swapChainDesc.Width = WinApp::kClientWidth;
-    swapChainDesc.Height = WinApp::kClientHeight;
-    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swapChainDesc.SampleDesc.Count = 1;
-    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDesc.BufferCount = 2;
-    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    // GetAddressOf()でComPtrが管理するポインタのダブルポインタを取得
-    hr = dxFactory->CreateSwapChainForHwnd(commandQueue.Get(), winApp->GetHwnd(), &swapChainDesc, nullptr, nullptr, reinterpret_cast<IDXGISwapChain1**>(swapChain.GetAddressOf()));
-    assert(SUCCEEDED(hr));
-
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtvDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128, true);
-
-    Microsoft::WRL::ComPtr<ID3D12Resource> swapChainResources[2];
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandles[2];
-    const uint32_t desriptorSizeSRV = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const uint32_t desriptorSizeRTV = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    const uint32_t desriptorSizeDSV = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-    UINT rtvDescriptorSize = desriptorSizeRTV;
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvStartHandle = rtvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT i = 0; i < 2; ++i) {
-        swapChain->GetBuffer(i, IID_PPV_ARGS(swapChainResources[i].GetAddressOf()));
-        rtvHandles[i].ptr = rtvStartHandle.ptr + (i * rtvDescriptorSize);
-        D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
-        rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        device->CreateRenderTargetView(swapChainResources[i].Get(), &rtvDesc, rtvHandles[i]);
-    }
-
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    uint64_t fenceValue = 0;
-    device->CreateFence(fenceValue, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf()));
-    HANDLE fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-
-    Microsoft::WRL::ComPtr<IDxcUtils> dxcUtils;
-    Microsoft::WRL::ComPtr<IDxcCompiler3> dxcCompiler;
-    DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(dxcUtils.GetAddressOf()));
-    DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(dxcCompiler.GetAddressOf()));
-    Microsoft::WRL::ComPtr<IDxcIncludeHandler> includeHandler;
-    dxcUtils->CreateDefaultIncludeHandler(includeHandler.GetAddressOf());
+    HRESULT hr;
 
     // DescriptorRange
     D3D12_DESCRIPTOR_RANGE descriptorRange[1] = {};
@@ -909,24 +749,6 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
     bool useMonsterBall = true;
 
-    D3D12_VIEWPORT viewport{ 0.0f, 0.0f, (float)WinApp::kClientWidth, (float)WinApp::kClientHeight, 0.0f, 1.0f };
-    D3D12_RECT scissorRect{ 0, 0, WinApp::kClientWidth, WinApp::kClientHeight };
-
-#ifdef USE_IMGUI
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGui::StyleColorsDark();
-    ImGui_ImplWin32_Init(winApp->GetHwnd());
-    ImGui_ImplDX12_Init(device.Get(),
-        swapChainDesc.BufferCount,
-        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-        srvDescriptorHeap.Get(),
-        srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
-        srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-    ImGuiIO& io = ImGui::GetIO();
-    io.Fonts->Build();
-#endif
-
     DirectX::ScratchImage mipImages = LoadTexture("resources/uvChecker.png");
     const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
     Microsoft::WRL::ComPtr<ID3D12Resource> textureResource = CreateTextureResource(device, metadata);
@@ -975,14 +797,6 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
     D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandleCPU2 = GetCPUDescriptorHandle(srvDescriptorHeap, desriptorSizeSRV, 2);
     D3D12_GPU_DESCRIPTOR_HANDLE textureSrvHandleGPU2 = GetGPUDescriptorHandle(srvDescriptorHeap, desriptorSizeSRV, 2);
     device->CreateShaderResourceView(textureResource2.Get(), &srvDesc2, textureSrvHandleCPU2);
-
-    // DepthStencil
-    Microsoft::WRL::ComPtr<ID3D12Resource> depthStencilResource = CreateDepthStencilTextureResource(device, WinApp::kClientWidth, WinApp::kClientHeight);
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsvDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, false);
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
-    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    device->CreateDepthStencilView(depthStencilResource.Get(), &dsvDesc, dsvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
 
     // XAudio2エンジンのインスタンスを生成
     hr = XAudio2Create(&xAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR);
@@ -1182,22 +996,26 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
         commandList->Reset(commandAllocator.Get(), nullptr);
     }
 
-#ifdef USE_IMGUI
-    ImGui_ImplDX12_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-#endif
-
     // 入力解放
     delete input;
-
-    // ComPtrで管理していないものだけ解放
-    CloseHandle(fenceEvent);
 
     // XAudio2解放（先にインスタンスをリセットしてからデータを解放する）
     xAudio2.Reset();
     // 音声データ解放
     SoundUnload(&soundData1);
+#endif
+
+    // 初期化確認用のメインループ (メッセージ処理のみ)
+    while (true) {
+        // Windowsのメッセージ処理
+        if (winApp->ProcessMessage()) {
+            // ゲームループを抜ける
+            break;
+        }
+    }
+
+    // DirectX解放 (ImGui終了・フェンスイベントのクローズはデストラクタで行う)
+    delete dxCommon;
 
     // WindowsAPIの終了処理 (CoUninitialize もここに含まれる)
     winApp->Finalize();
