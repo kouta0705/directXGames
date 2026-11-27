@@ -7,6 +7,7 @@
 #include <array>
 #include <vector>
 #include <chrono>
+#include <string>
 
 #include "externals/DirectXTex/DirectXTex.h"
 
@@ -35,6 +36,26 @@ public:
     Microsoft::WRL::ComPtr<ID3D12Resource> UploadTextureData(
         const Microsoft::WRL::ComPtr<ID3D12Resource>& texture,
         const DirectX::ScratchImage& mipImages);
+
+    /// <summary>
+    /// バッファリソースの生成 (アップロードヒープ)
+    /// </summary>
+    Microsoft::WRL::ComPtr<ID3D12Resource> CreateBufferResource(size_t sizeInBytes);
+
+    /// <summary>
+    /// テクスチャリソースの生成
+    /// </summary>
+    Microsoft::WRL::ComPtr<ID3D12Resource> CreateTextureResource(const DirectX::TexMetadata& metadata);
+
+    /// <summary>
+    /// テクスチャファイルの読み込み (ミップマップ生成まで行う)
+    /// </summary>
+    static DirectX::ScratchImage LoadTexture(const std::string& filePath);
+
+    /// <summary>
+    /// シェーダーのコンパイル
+    /// </summary>
+    Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(const std::wstring& filePath, const wchar_t* profile);
 
     /// <summary>
     /// コマンドを実行してGPUの完了を待ち、コマンドリストを再び使える状態に戻す
@@ -87,7 +108,6 @@ private:
         D3D12_DESCRIPTOR_HEAP_TYPE heapType, UINT numDescriptors, bool shaderVisible);
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateDepthStencilTextureResource(
         int32_t width, int32_t height);
-    Microsoft::WRL::ComPtr<ID3D12Resource> CreateBufferResource(size_t sizeInBytes);
 
 private:
     // WindowsAPI (借り物なのでdeleteしない)

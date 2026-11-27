@@ -1,5 +1,7 @@
 #include "DirectXCommon.h"
 #include "Logger.h"
+#include "StringUtility.h"
+#include <format>
 #include <cassert>
 #include <vector>
 #include <thread>
@@ -555,6 +557,86 @@ ComPtr<ID3D12Resource> DirectXCommon::CreateBufferResource(size_t sizeInBytes)
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource));
     assert(SUCCEEDED(hr));
     return resource;
+}
+
+// ======================================================
+// テクスチャ・シェーダー関連
+// ======================================================
+ComPtr<ID3D12Resource> DirectXCommon::CreateTextureResource(const DirectX::TexMetadata& metadata)
+{
+    D3D12_RESOURCE_DESC resourceDesc{};
+    resourceDesc.Width = UINT(metadata.width);
+    resourceDesc.Height = UINT(metadata.height);
+    resourceDesc.MipLevels = UINT16(metadata.mipLevels);
+    resourceDesc.DepthOrArraySize = UINT16(metadata.arraySize);
+    resourceDesc.Format = metadata.format;
+    resourceDesc.SampleDesc.Count = 1;
+    resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION(metadata.dimension);
+
+    D3D12_HEAP_PROPERTIES heapProperties{};
+    heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    ComPtr<ID3D12Resource> resource;
+    HRESULT hr = device_->CreateCommittedResource(
+        &heapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(resource.GetAddressOf()));
+    assert(SUCCEEDED(hr));
+    return resource;
+}
+
+DirectX::ScratchImage DirectXCommon::LoadTexture(const std::string& filePath)
+{
+    DirectX::ScratchImage image{};
+    std::wstring filePathW = StringUtility::ConvertString(filePath);
+    HRESULT hr = DirectX::LoadFromWICFile(filePathW.c_str(), DirectX::WIC_FLAGS_FORCE_SRGB, nullptr, image);
+    assert(SUCCEEDED(hr));
+
+    DirectX::ScratchImage mipImages{};
+    hr = DirectX::GenerateMipMaps(image.GetImages(), image.GetImageCount(), image.GetMetadata(), DirectX::TEX_FILTER_SRGB, 0, mipImages);
+    assert(SUCCEEDED(hr));
+
+    return mipImages;
+}
+
+ComPtr<IDxcBlob> DirectXCommon::CompileShader(const std::wstring& filePath, const wchar_t* profile)
+{
+    Logger::Log(StringUtility::ConvertString(std::format(L"Begin CompileShader, path:{}, profile:{}\n", filePath, profile)));
+
+    ComPtr<IDxcBlobEncoding> shaderSource;
+    HRESULT hr = dxcUtils_->LoadFile(filePath.c_str(), nullptr, shaderSource.GetAddressOf());
+    assert(SUCCEEDED(hr));
+
+    DxcBuffer shaderSourceBuffer;
+    shaderSourceBuffer.Ptr = shaderSource->GetBufferPointer();
+    shaderSourceBuffer.Size = shaderSource->GetBufferSize();
+    shaderSourceBuffer.Encoding = DXC_CP_UTF8;
+
+    LPCWSTR arguments[] = {
+        filePath.c_str(), L"-E", L"main", L"-T", profile,
+        L"-Zi", L"-Qembed_debug", L"-Od", L"-Zpr",
+    };
+
+    ComPtr<IDxcResult> shaderResult;
+    hr = dxcCompiler_->Compile(&shaderSourceBuffer, arguments, _countof(arguments), includeHandler_.Get(), IID_PPV_ARGS(shaderResult.GetAddressOf()));
+    assert(SUCCEEDED(hr));
+
+    ComPtr<IDxcBlobUtf8> shaderError;
+    shaderResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(shaderError.GetAddressOf()), nullptr);
+    if (shaderError != nullptr && shaderError->GetStringLength() != 0) {
+        Logger::Log(shaderError->GetStringPointer());
+        assert(false);
+    }
+
+    ComPtr<IDxcBlob> shaderBlob;
+    hr = shaderResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(shaderBlob.GetAddressOf()), nullptr);
+    assert(SUCCEEDED(hr));
+    Logger::Log(StringUtility::ConvertString(std::format(L"Compile Succeeded, path:{}, profile:{}\n", filePath, profile)));
+    // ComPtrなのでRelease不要
+    return shaderBlob;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE DirectXCommon::GetCPUDescriptorHandle(
